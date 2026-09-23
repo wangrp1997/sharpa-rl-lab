@@ -103,7 +103,7 @@ class SharpaWaveEnvCfg(DirectRLEnvCfg):
                 "right_thumb_MCP_FE": math.pi/180 * 14.81626,
                 "right_thumb_MCP_AA": math.pi/180 * -1.03493,
                 "right_thumb_IP": math.pi/180 * 12.23986,
-                "right_index_MCP_FE": math.pi/180 * 65.21091, 
+                "right_index_MCP_FE": math.pi/180 * 65.21091,
                 "right_index_MCP_AA": math.pi/180 * 6.1133,
                 "right_index_PIP": math.pi/180 * 15.58495,
                 "right_index_DIP": math.pi/180 * 5.90325,
@@ -259,8 +259,14 @@ class SharpaWaveEnvCfg(DirectRLEnvCfg):
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=16384, env_spacing=0.75, replicate_physics=False)
     # 45 degrees in the XY plane, higher and looking steeply down.
     viewer = ViewerCfg(eye=(0.03, 0.12, 0.98), lookat=(-0.096, -0.005, 0.619))
-    # When true, hold the nominal joint pose instead of resampling failed grasps.
+    # When true, hold one pose instead of resampling failed grasps.
     hold_pose = False
+    # Stop the search after this many successful grasps. The original run uses 50000.
+    max_grasps = 50000
+    # Keep the live physics state when a downward grasp is found, instead of replaying it.
+    freeze_on_success = False
+    # Set to a .npy cache to replay one saved grasp instead of searching.
+    replay_cache = None
     # event
     events: EventCfg = EventCfg()
     # reset

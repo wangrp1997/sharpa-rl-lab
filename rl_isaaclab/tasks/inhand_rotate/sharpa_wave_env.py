@@ -249,7 +249,7 @@ class SharpaWaveInhandRotateEnv(DirectRLEnv):
         height_reset_lower = self.object_pos[:, 2] < self.reset_height_lower
         height_reset = height_reset_upper | height_reset_lower
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-        if getattr(self.cfg, "hold_pose", False):
+        if getattr(self.cfg, "hold_pose", False) or getattr(self, "frozen", False):
             height_reset = torch.zeros_like(height_reset)
             time_out = torch.zeros_like(time_out)
         self.extras['height_reset_upper'] = height_reset_upper.float().mean()

@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING
 
 import carb
 import isaaclab.sim as sim_utils
-import omni.physics.tensors.impl.api as physx
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
@@ -29,6 +28,13 @@ class SharpaWaveInhandRotateEnv(DirectRLEnv):
     cfg: SharpaWaveEnvCfg
 
     def __init__(self, cfg: SharpaWaveEnvCfg, render_mode: str | None = None, **kwargs):
+        # Lab 3 clones assets declared on the scene config. The hand, object, and
+        # contact sensors used to be spawned later inside _setup_scene.
+        cfg.scene.robot = cfg.robot_cfg
+        cfg.scene.object = cfg.object_cfg
+        for sensor_id, sensor_cfg in enumerate(cfg.contact_sensor):
+            setattr(cfg.scene, f"contact_sensor_{sensor_id}", sensor_cfg)
+
         self.reset_height_lower = torch.zeros(cfg.scene.num_envs, device=cfg.sim.device)
         self.reset_height_upper = torch.zeros(cfg.scene.num_envs, device=cfg.sim.device)
 
@@ -84,7 +90,7 @@ class SharpaWaveInhandRotateEnv(DirectRLEnv):
         self.num_fingertips = len(self.finger_bodies)
 
         # joint limits
-        joint_pos_limits = self.hand.root_physx_view.get_dof_limits().to(self.device)
+        joint_pos_limits = self.hand.data.joint_pos_limits.torch.to(self.device)
         self.hand_dof_lower_limits = joint_pos_limits[..., 0] * self.cfg.dof_limits_scale
         self.hand_dof_upper_limits = joint_pos_limits[..., 1] * self.cfg.dof_limits_scale
 
@@ -148,29 +154,19 @@ class SharpaWaveInhandRotateEnv(DirectRLEnv):
         if self.cfg.randomize_mass:
             rand_mass = torch.empty(self.num_envs).uniform_(self.cfg.randomize_mass_lower, self.cfg.randomize_mass_upper)
             self.set_mass(self.object, rand_mass, self.num_envs)
-            self.priv_info_buf[:, 4] = self.object.root_physx_view.get_masses().reshape(self.num_envs)
+            self.priv_info_buf[:, 4] = self.object.data.body_mass.torch.reshape(self.num_envs, -1)[:, 0]
 
         # physics_sim_view
-        self.physics_sim_view: physx.SimulationView = sim_utils.SimulationContext.instance().physics_sim_view
+        self.physics_sim_view = sim_utils.SimulationContext.instance().physics_sim_view
 
     def _setup_scene(self):
-        # add hand, in-hand object, and goal object
-        self.hand = Articulation(self.cfg.robot_cfg)
-        self.object = RigidObject(self.cfg.object_cfg)
-        # add ground plane
+        self.hand = self.scene.articulations["robot"]
+        self.object = self.scene.rigid_objects["object"]
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
-        # clone and replicate (no need to filter for this environment)
-        self.scene.clone_environments(copy_from_source=False)
-        self.scene.filter_collisions()
-        # add articulation to scene - we must register to scene to randomize with EventManager
-        self.scene.articulations["robot"] = self.hand
-        self.scene.rigid_objects["object"] = self.object
-        # contact sensors
-        self._contact_sensor = []
-        for id in range(len(self.cfg.contact_sensor)):
-            self._contact_sensor.append(ContactSensor(self.cfg.contact_sensor[id]))
-            self.scene.sensors[f"contact_sensor_{id}"] = self._contact_sensor[id]
-        # add lights
+        self._contact_sensor = [
+            self.scene.sensors[f"contact_sensor_{sensor_id}"]
+            for sensor_id in range(len(self.cfg.contact_sensor))
+        ]
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
@@ -253,6 +249,9 @@ class SharpaWaveInhandRotateEnv(DirectRLEnv):
         height_reset_lower = self.object_pos[:, 2] < self.reset_height_lower
         height_reset = height_reset_upper | height_reset_lower
         time_out = self.episode_length_buf >= self.max_episode_length - 1
+        if getattr(self.cfg, "hold_pose", False):
+            height_reset = torch.zeros_like(height_reset)
+            time_out = torch.zeros_like(time_out)
         self.extras['height_reset_upper'] = height_reset_upper.float().mean()
         self.extras['height_reset_lower'] = height_reset_lower.float().mean()
         self.extras['time_out'] = time_out.float().mean()
@@ -359,8 +358,8 @@ class SharpaWaveInhandRotateEnv(DirectRLEnv):
         self.hand_dof_torque = self.hand.data.applied_torque
 
         # data for object
-        self.object_pos = self.object.data.root_pos_w - self.scene.env_origins
-        self.object_rot = self.object.data.root_quat_w
+        self.object_pos = self.object.data.root_pos_w.torch - self.scene.env_origins
+        self.object_rot = self.object.data.root_quat_w.torch
         self.object_velocities = self.object.data.root_vel_w
         self.object_linvel = self.object.data.root_lin_vel_w
         self.object_angvel = self.object.data.root_ang_vel_w
@@ -463,8 +462,8 @@ class SharpaWaveInhandRotateEnv(DirectRLEnv):
         asset.root_physx_view.set_coms(coms, env_ids)
 
     def set_mass(self, asset, value, num_envs):
-        env_ids = torch.arange(num_envs, device="cpu")
-        asset.root_physx_view.set_masses(value, env_ids)
+        masses = value.reshape(num_envs, -1).to(dtype=torch.float32, device=asset.device)
+        asset.set_masses(masses=masses)
 
 
 @torch.jit.script

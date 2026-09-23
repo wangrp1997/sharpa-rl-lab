@@ -4,7 +4,7 @@ import math
 import torch
 from typing import TYPE_CHECKING
 
-from isaacsim.core.utils.stage import get_current_stage
+from isaaclab.sim.utils.stage import get_current_stage
 from pxr import Gf, Sdf, UsdGeom, Vt
 
 import isaaclab.sim as sim_utils
@@ -113,7 +113,7 @@ def randomize_rigid_body_scale(
             # if the scale attribute does not exist, create it
             has_scale_attr = scale_spec is not None
             if not has_scale_attr:
-                scale_spec = Sdf.AttributeSpec(prim_spec, prim_path + ".xformOp:scale", Sdf.ValueTypeNames.Double3)
+                scale_spec = Sdf.AttributeSpec(prim_spec, "xformOp:scale", Sdf.ValueTypeNames.Double3)
 
             # set the new scale
             scale_spec.default = Gf.Vec3f(*rand_samples[i])

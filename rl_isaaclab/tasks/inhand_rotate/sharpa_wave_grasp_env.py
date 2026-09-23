@@ -37,10 +37,14 @@ class SharpaWaveInhandRotateGraspEnv(SharpaWaveInhandRotateEnv):
         cond1 = (torch.norm(self.fingertip_pos - self.object_pos.unsqueeze(1), dim=-1, p=2) < 0.1).all(-1)
         filtered_force_matrix = torch.cat([self._contact_sensor[id].data.force_matrix_w[:, 0, 0, :].unsqueeze(1) for id in range(10)], dim=1)
         cond2 = (torch.norm(filtered_force_matrix, dim=-1, p=2) > 0.5).sum(-1) >= 3
-        cond3 = torch.less(quat_to_rot(quat_mul(self.object_rot, quat_conjugate(self.object.data.default_root_state.clone()[:, 3:7]))), self.cfg.reset_angle_diff)
+        default_quat = self.object.data.default_root_state.torch[:, 3:7]
+        cond3 = torch.less(quat_to_rot(quat_mul(self.object_rot, quat_conjugate(default_quat))), self.cfg.reset_angle_diff)
         cond = cond1.float() * cond2.float() * cond3.float()
-        self.reset_buf[cond < 1] = 1
-        if self.common_step_counter % 40 == 0:
+        if not self.cfg.hold_pose:
+            self.reset_buf[cond < 1] = 1
+        # Grasp search flips gravity through six axes, including straight up.
+        # The viewer holds one pose, so leave gravity pointing down.
+        if self.common_step_counter % 40 == 0 and not self.cfg.hold_pose:
             self.physics_sim_view.set_gravity(self.gravity_all_directions[self.gravity_id])
             self.gravity_id += 1
             self.gravity_id %= len(self.gravity_all_directions)
@@ -92,6 +96,7 @@ class SharpaWaveInhandRotateGraspEnv(SharpaWaveInhandRotateEnv):
         self.episode_length_buf[env_ids] = 0
 
         rand_floats = 2.0 * torch.rand((len(env_ids), self.num_hand_dofs), device=self.device) - 1.0
+        joint_noise = 0.0 if self.cfg.hold_pose else 0.15
         
         # reset object
         object_default_state = self.object.data.default_root_state.clone()[env_ids]
@@ -105,7 +110,7 @@ class SharpaWaveInhandRotateGraspEnv(SharpaWaveInhandRotateEnv):
         self.reset_height_upper[env_ids] = self.cfg.reset_height_upper
 
         # reset hand
-        dof_pos = self.hand.data.default_joint_pos[env_ids] + 0.15 * rand_floats
+        dof_pos = self.hand.data.default_joint_pos[env_ids] + joint_noise * rand_floats
         dof_pos = saturate(dof_pos, self.hand_dof_lower_limits[env_ids], self.hand_dof_upper_limits[env_ids],)
         dof_vel = torch.zeros_like(self.hand.data.default_joint_vel[env_ids])
 
@@ -129,5 +134,7 @@ class SharpaWaveInhandRotateGraspEnv(SharpaWaveInhandRotateEnv):
 @torch.jit.script
 def quat_to_rot(quaternion: torch.Tensor):
     quaternion = quaternion / torch.norm(quaternion, dim=-1, keepdim=True)
-    angle = 2 * torch.acos(quaternion[:, 0])
+    # Lab 3 quaternions are (x, y, z, w).
+    w = quaternion[:, 3].clamp(-1.0, 1.0)
+    angle = 2 * torch.acos(w.abs())
     return angle

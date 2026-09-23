@@ -9,11 +9,12 @@ import os
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, RigidObjectCfg
 from isaaclab.actuators.actuator_cfg import IdealPDActuatorCfg
-from isaaclab.envs import DirectRLEnvCfg
+from isaaclab.envs import DirectRLEnvCfg, ViewerCfg
 from isaaclab.managers import EventTermCfg, SceneEntityCfg
 from isaaclab.sensors import ContactSensorCfg
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sim import PhysxCfg, SimulationCfg
+from isaaclab.sim import SimulationCfg
+from isaaclab_physx.physics import PhysxCfg
 from isaaclab.utils import configclass
 
 from rl_isaaclab.utils.modified_events import randomize_rigid_body_scale
@@ -53,7 +54,8 @@ class SharpaWaveEnvCfg(DirectRLEnvCfg):
         dt=1 / 240,
         render_interval=2,
         gravity=(0.0, 0.0, -9.81),
-        physx=PhysxCfg(
+        use_newton_actuators=False,
+        physics=PhysxCfg(
             solver_type=1,
             max_position_iteration_count=8,
             max_velocity_iteration_count=0,
@@ -63,7 +65,8 @@ class SharpaWaveEnvCfg(DirectRLEnvCfg):
         ),
     )
     # robot
-    hand_init_pose = ((0.0, 0.0, 0.5), (0.819152, 0.0, -0.5735764, 0.0))
+    # Lab 3 poses are (x, y, z, w). These values are the original (w, x, y, z) pose.
+    hand_init_pose = ((0.0, 0.0, 0.5), (0.0, -0.5735764, 0.0, 0.819152))
     robot_cfg: ArticulationCfg = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot",
         spawn=sim_utils.UsdFileCfg(
@@ -122,8 +125,8 @@ class SharpaWaveEnvCfg(DirectRLEnvCfg):
         actuators={
             "joints": IdealPDActuatorCfg(
                 joint_names_expr=[".*"],
-                stiffness=None,
-                damping=None,
+                stiffness=3.0,
+                damping=0.1,
             ),
         },
         soft_joint_pos_limit_factor=1.0,
@@ -250,10 +253,14 @@ class SharpaWaveEnvCfg(DirectRLEnvCfg):
             mass_props=sim_utils.MassPropertiesCfg(mass=0.05),
             scale=(1., 1., 1.),
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(-0.09559, -0.00517, 0.61906), rot=(1.0, 0.0, 0.0, 0.0)),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(-0.09559, -0.00517, 0.61906), rot=(0.0, 0.0, 0.0, 1.0)),
     )
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=16384, env_spacing=0.75, replicate_physics=False)
+    # 45 degrees in the XY plane, higher and looking steeply down.
+    viewer = ViewerCfg(eye=(0.03, 0.12, 0.98), lookat=(-0.096, -0.005, 0.619))
+    # When true, hold the nominal joint pose instead of resampling failed grasps.
+    hold_pose = False
     # event
     events: EventCfg = EventCfg()
     # reset

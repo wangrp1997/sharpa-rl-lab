@@ -8,11 +8,15 @@ import argparse
 import sys
 import shutil
 
+# Isaac Lab 3 dropped --headless. With no visualizer selected, the app is already headless.
+sys.argv = [arg for arg in sys.argv if arg != "--headless"]
+
 from isaaclab.app import AppLauncher
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent.")
 parser.add_argument("--num_envs", type=int, default=16384, help="Number of environments to simulate.")
+parser.add_argument("--hold", action="store_true", help="Hold the nominal grasp pose instead of resampling.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=42, help="Seed used for the environment")
 parser.add_argument("--max_agent_steps", type=int, default=None, help="RL Policy training iterations.")
@@ -50,7 +54,8 @@ torch.backends.cudnn.benchmark = False
 
 @hydra_task_config(args_cli.task, "agent_cfg_entry_point")
 def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
-    shutil.rmtree('outputs/')
+    shutil.rmtree('outputs/', ignore_errors=True)
+    env_cfg.hold_pose = args_cli.hold
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     env_cfg.seed = args_cli.seed if args_cli.seed is not None else agent_cfg['seed']
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device

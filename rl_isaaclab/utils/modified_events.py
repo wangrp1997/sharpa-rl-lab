@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 import torch
 from typing import TYPE_CHECKING
 
@@ -14,6 +15,29 @@ from isaaclab.managers import SceneEntityCfg
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
+
+_ENV_INDEX = re.compile(r"/env_(\d+)(?:/|$)")
+
+
+def _one_asset_root_per_env(prim_paths: list[str]) -> dict[int, str] | None:
+    """Map each environment to the asset root, dropping nested namesakes.
+
+    ``env_.*`` is matched as a regular expression, and ``.*`` crosses ``/``.
+    The cylinder USD nests ``/object/object``, so both prims match
+    ``/World/envs/env_.*/object``. Indexing that list by environment number
+    then writes the scale onto the inner prim as well, and the two scales
+    multiply. Keep the shallowest match for each ``env_{id}``.
+    """
+    chosen: dict[int, str] = {}
+    for path in prim_paths:
+        match = _ENV_INDEX.search(path)
+        if match is None:
+            return None
+        env_id = int(match.group(1))
+        current = chosen.get(env_id)
+        if current is None or path.count("/") < current.count("/"):
+            chosen[env_id] = path
+    return chosen
 
 
 def randomize_rigid_body_scale(
@@ -76,6 +100,7 @@ def randomize_rigid_body_scale(
     stage = get_current_stage()
     # resolve prim paths for spawning and cloning
     prim_paths = sim_utils.find_matching_prim_paths(asset.cfg.prim_path)
+    prim_by_env = _one_asset_root_per_env(prim_paths)
 
     # sample scale values
     if isinstance(scale_range, dict):
@@ -104,7 +129,11 @@ def randomize_rigid_body_scale(
     with Sdf.ChangeBlock():
         for i, env_id in enumerate(env_ids):
             # path to prim to randomize
-            prim_path = prim_paths[env_id] + relative_child_path
+            env_id_int = int(env_id)
+            if prim_by_env is None:
+                prim_path = prim_paths[env_id_int] + relative_child_path
+            else:
+                prim_path = prim_by_env[env_id_int] + relative_child_path
             # spawn single instance
             prim_spec = Sdf.CreatePrimInLayer(stage.GetRootLayer(), prim_path)
 

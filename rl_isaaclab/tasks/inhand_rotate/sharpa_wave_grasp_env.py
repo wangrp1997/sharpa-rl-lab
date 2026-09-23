@@ -13,6 +13,7 @@ import torch
 from collections.abc import Sequence
 
 import carb
+import isaaclab.sim as sim_utils
 from isaaclab.utils.math import quat_conjugate, quat_mul, saturate
 
 from .sharpa_wave_grasp_env_cfg import SharpaWaveEnvCfg
@@ -58,13 +59,6 @@ class SharpaWaveInhandRotateGraspEnv(SharpaWaveInhandRotateEnv):
                     state = torch.cat([self.hand_dof_pos, self.object_pos, self.object_rot], dim=1)
                     self.down_pose[good] = state[good]
                     self.has_down_pose[good] = True
-                    if self.cfg.freeze_on_success:
-                        self.frozen = True
-                        pose = state[good][:1].detach().cpu().numpy()
-                        os.makedirs("cache", exist_ok=True)
-                        name = f"cache/sharpa_grasp_linspace_{self.cfg.scale_range[0]}-{self.cfg.scale_range[1]}-{self.cfg.scale_range[2]}.npy"
-                        np.save(name, pose)
-                        print(f"FROZEN stable grasp, saved {name}", flush=True)
         # Grasp search flips gravity through six axes, including straight up.
         # The viewer holds one pose, so leave gravity pointing down.
         if self.common_step_counter % 40 == 0 and not self.cfg.hold_pose and not self.frozen:
@@ -82,6 +76,13 @@ class SharpaWaveInhandRotateGraspEnv(SharpaWaveInhandRotateEnv):
 
         self._refresh_lab()
         success = (self.episode_length_buf == self.max_episode_length - 1) & self.has_down_pose
+        if self.cfg.freeze_on_success and torch.any(success):
+            winner = int(torch.nonzero(success.reshape(-1))[0].item())
+            self.frozen = True
+            self._focus_env(winner)
+            self.episode_length_buf[:] = 0
+            print(f"FROZEN env {winner}. Camera moved there. Other envs stopped resampling.", flush=True)
+            return
         all_states = self.down_pose[success]
         saved_scale_ids = self.scale_ids[success].reshape(-1)
         target = max(int(self.cfg.max_grasps), 1)
@@ -172,6 +173,15 @@ class SharpaWaveInhandRotateGraspEnv(SharpaWaveInhandRotateEnv):
         self.proprio_hist_buf[env_ids] = 0
         self.at_reset_buf[env_ids] = 1
         self.has_down_pose[env_ids] = False
+
+    def _focus_env(self, env_id: int) -> None:
+        origin = self.scene.env_origins[env_id]
+        look = (origin + self.object_pos[env_id]).detach().cpu()
+        eye = look + torch.tensor([0.126, 0.125, 0.361])
+        sim_utils.SimulationContext.instance().set_camera_view(
+            tuple(float(v) for v in eye.tolist()),
+            tuple(float(v) for v in look.tolist()),
+        )
 
 
 @torch.jit.script

@@ -79,6 +79,14 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
     env = GymStyleEnvWrapper(env, clip_actions=env_cfg.clip_actions)
 
     env.reset()
+    if args_cli.freeze and env.unwrapped.num_envs > 1:
+        base = env.unwrapped
+        center = base.scene.env_origins.detach().float().mean(dim=0).cpu()
+        eye = center + torch.tensor([0.0, -7.0, 6.0])
+        base.sim.set_camera_view(
+            tuple(float(v) for v in eye.tolist()),
+            tuple(float(v) for v in center.tolist()),
+        )
     while True:
         actions = env.zero_actions()
         _ = env.step(actions)

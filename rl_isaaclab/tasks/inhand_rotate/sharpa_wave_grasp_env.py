@@ -33,6 +33,8 @@ class SharpaWaveInhandRotateGraspEnv(SharpaWaveInhandRotateEnv):
         self.down_pose = torch.zeros((self.num_envs, 29), dtype=torch.float32, device=self.device)
         self.has_down_pose = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.frozen = False
+        self.frozen_env_id = None
+        self.live_success = None
         self.gravity_id = 0
         self.gravity_all_directions = [
             carb.Float3(0.0, 0.0, 9.81),
@@ -77,11 +79,19 @@ class SharpaWaveInhandRotateGraspEnv(SharpaWaveInhandRotateEnv):
         self._refresh_lab()
         success = (self.episode_length_buf == self.max_episode_length - 1) & self.has_down_pose
         if self.cfg.freeze_on_success and torch.any(success):
-            winner = int(torch.nonzero(success.reshape(-1))[0].item())
+            winners = torch.nonzero(success.reshape(-1)).flatten()
+            winner = int(winners[int(torch.randint(winners.numel(), (1,), device=winners.device))].item())
             self.frozen = True
+            self.frozen_env_id = winner
+            self.live_success = success.clone()
+            self.physics_sim_view.set_gravity(carb.Float3(0.0, 0.0, -9.81))
             self._focus_env(winner)
             self.episode_length_buf[:] = 0
-            print(f"FROZEN env {winner}. Camera moved there. Other envs stopped resampling.", flush=True)
+            print(
+                f"FROZEN env {winner}. live={int(success.sum().item())}. "
+                "Camera moved there. Other envs stopped resampling.",
+                flush=True,
+            )
             return
         all_states = self.down_pose[success]
         saved_scale_ids = self.scale_ids[success].reshape(-1)

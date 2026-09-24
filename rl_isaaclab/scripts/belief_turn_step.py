@@ -37,6 +37,11 @@ MAX_DQ = 0.008
 REGULARIZATION = 1e-4
 OVERLAP_WEIGHT = 50.0
 TWIST_WEIGHT = 1.0
+LINEAR_WEIGHT = 1.0
+SHELL_SLACK = 1.0
+NORMAL_BAND = 1.0
+TRACK_WEIGHT = 5.0
+APPROACH_WEIGHT = 0.2
 
 
 def trust_length(axis_std, step_max=STEP_MAX, sigma_wide=SIGMA_WIDE):
@@ -96,6 +101,8 @@ def plan_belief_step(
     step_max=STEP_MAX,
     sigma_wide=SIGMA_WIDE,
     max_dq=MAX_DQ,
+    shells=None,
+    axis=None,
 ):
     """Joint increment and object twist. The twist is not measured.
 
@@ -120,13 +127,13 @@ def plan_belief_step(
         "directions": [None] * len(jacobians),
         "enclosed": False,
     }
-    axis = _turn.axis_from_normals(normals)
+    axis = _turn.axis_from_normals(normals) if axis is None else np.asarray(axis, dtype=np.float64)
+    if axis is not None:
+        axis = axis / max(float(np.linalg.norm(axis)), 1e-9)
     if axis is None or n_dof == 0 or len(points) != len(jacobians):
         return empty
     empty["axis"] = axis
-    if not normals_enclose(normals):
-        return empty
-    empty["enclosed"] = True
+    empty["enclosed"] = normals_enclose(normals)
     centroid = np.mean(np.stack(points), axis=0)
     levers = [point - centroid for point in points]
     radius = float(np.mean([np.linalg.norm(lever) for lever in levers]))
@@ -144,14 +151,27 @@ def plan_belief_step(
     bound_low = np.maximum(lower - q, -max_dq)
     bound_high = np.minimum(upper - q, max_dq)
     n_twist = 6
-    equalities = []
     normal_rows = []
-    for normal, jac, lever in zip(normals, jacobians, levers):
+    normal_limits = []
+    band = NORMAL_BAND * float(axis_std)
+    track = np.zeros((n_dof, n_dof))
+    track_linear = np.zeros(n_dof)
+    for normal, jac, lever, direction in zip(normals, jacobians, levers, directions):
         unit = normal / max(float(np.linalg.norm(normal)), 1e-9)
         cross = _skew(lever)
         block = np.concatenate([jac, -np.eye(3), cross], axis=1)
-        equalities.append(block)
-        normal_rows.append(unit @ block)
+        normal_row = unit @ block
+        normal_rows.append(normal_row)
+        normal_rows.append(-normal_row)
+        normal_limits.append(band)
+        normal_limits.append(band)
+        if direction is None:
+            continue
+        desired = np.asarray(direction, dtype=np.float64) * length
+        projector = np.eye(3) - np.outer(unit, unit)
+        weighted = projector @ jac
+        track += weighted.T @ weighted
+        track_linear += weighted.T @ (projector @ desired)
     overlap_rows = []
     overlap_gaps = []
     for direction, jac_i, jac_j, distance in pairs:
@@ -169,27 +189,41 @@ def plan_belief_step(
     n_slack = len(overlap_rows)
     width = n_dof + n_twist + n_slack
     cost = np.eye(width) * REGULARIZATION
+    cost[:n_dof, :n_dof] += TRACK_WEIGHT * track
+    cost[n_dof:n_dof + 3, n_dof:n_dof + 3] = LINEAR_WEIGHT * np.eye(3)
     cost[n_dof + 3:n_dof + 6, n_dof + 3:n_dof + 6] = TWIST_WEIGHT * np.eye(3)
     linear = np.zeros(width)
+    linear[:n_dof] = -TRACK_WEIGHT * track_linear
     linear[n_dof + 3:n_dof + 6] = -TWIST_WEIGHT * axis * angle
     if n_slack:
         cost[n_dof + n_twist:, n_dof + n_twist:] = OVERLAP_WEIGHT * np.eye(n_slack)
     bound_low = np.concatenate([bound_low, np.full(n_twist, -1.0), np.zeros(n_slack)])
     bound_high = np.concatenate([bound_high, np.full(n_twist, 1.0), np.full(n_slack, 1.0)])
     gain_rows = [np.concatenate([row, np.zeros(n_slack)]) for row in normal_rows]
-    gain_limits = [0.0] * len(normal_rows)
+    gain_limits = list(normal_limits)
     for index, (row, gap) in enumerate(zip(overlap_rows, overlap_gaps)):
         padded = np.concatenate([row, np.zeros(n_slack)])
         padded[n_dof + n_twist + index] = -1.0
         gain_rows.append(padded)
         gain_limits.append(gap)
+    for direction, shell_jac, point, gap in shells or []:
+        unit = np.asarray(direction, dtype=np.float64)
+        unit = unit / max(float(np.linalg.norm(unit)), 1e-9)
+        lever = np.asarray(point, dtype=np.float64).reshape(3) - centroid
+        row = np.zeros(width)
+        row[:n_dof] = -unit @ np.asarray(shell_jac, dtype=np.float64)
+        row[n_dof:n_dof + 3] = unit
+        row[n_dof + 3:n_dof + 6] = np.cross(lever, unit)
+        gain_rows.append(row)
+        gain_limits.append(max(float(gap), 0.0) + SHELL_SLACK * float(axis_std))
+        linear[:n_dof] += APPROACH_WEIGHT * np.asarray(shell_jac, dtype=np.float64).T @ unit
     solution = solve_qp(
         cost,
         linear,
         np.vstack(gain_rows),
         np.asarray(gain_limits, dtype=np.float64),
-        np.vstack([np.hstack([row, np.zeros((row.shape[0], n_slack))]) for row in equalities]),
-        np.zeros(3 * len(jacobians)),
+        None,
+        None,
         lb=bound_low,
         ub=bound_high,
         solver="osqp",
@@ -218,7 +252,7 @@ def plan_belief_step(
         "length": length,
         "moved": moved,
         "directions": directions,
-        "enclosed": True,
+        "enclosed": bool(empty["enclosed"]),
     }
 
 
@@ -245,9 +279,17 @@ def _check():
     assert normals_enclose(normals)
     assert not normals_enclose(normals[:2])
     open_grasp = plan_belief_step(
-        normals[:2], jacobians[:2], points[:2], joints[:2], lowers[:2], uppers[:2], [], axis_std=SIGMA_WIDE
+        normals[:2],
+        jacobians[:2],
+        points[:2],
+        [np.zeros(9)],
+        [np.full(9, -1.0)],
+        [np.full(9, 1.0)],
+        [],
+        axis_std=SIGMA_WIDE,
     )
-    assert open_grasp["moved"] == []
+    assert open_grasp["enclosed"] is False
+    assert open_grasp["moved"] == [0, 1]
     tight = plan_belief_step(
         normals, jacobians, points, joints, lowers, uppers, [], axis_std=SIGMA_WIDE
     )

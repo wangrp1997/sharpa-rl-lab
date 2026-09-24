@@ -221,8 +221,9 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
             forces = pad_forces(base)[env_id]
             loads = np.linalg.norm(forces, axis=-1)
             center, quat = object_pose(base, env_id)
-            held_ok = all(float(loads[i]) > empty + noise for i in loaded)
-            if float(center[2]) < z0 - DROP or not held_ok:
+            active_now = [i for i in range(5) if float(loads[i]) > empty + noise]
+            held_ok = len(active_now) >= 2 and float(center[2]) >= z0 - DROP
+            if not held_ok:
                 pads_stop = pads_of(base, env_id)
                 records.append({
                     "event": "stop",
@@ -236,7 +237,7 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
                 print(f"stop step {step_id} held={held_ok} z={float(center[2]):.4f}", flush=True)
                 held_ok = False
                 break
-            active = [i for i in loaded if float(loads[i]) > empty + noise]
+            active = active_now
             normals = [forces[i] / np.linalg.norm(forces[i]) for i in active]
             jac = base.hand.data.body_link_jacobian_w.torch[env_id].detach().cpu().numpy()
             contact_jacs = [jac[elastomer_jac[i], :3, :][:, jac_columns] for i in active]
@@ -250,6 +251,23 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
             axis = turn_step.axis_from_normals(normals)
             axis_std = AXIS_STD0 if axis is None else float(np.sqrt(max(axis @ covariance @ axis, 0.0)))
             pads_before = pads_of(base, env_id)
+            centroid = np.mean(pads_before[active], axis=0)
+            radius = float(np.mean([np.linalg.norm(pads_before[i] - centroid) for i in active]))
+            shells = []
+            for finger in range(5):
+                if finger in active:
+                    continue
+                point = pads_before[finger]
+                delta = point - centroid
+                dist = float(np.linalg.norm(delta))
+                if dist < 1e-5:
+                    continue
+                shells.append((
+                    delta / dist,
+                    jac[elastomer_jac[finger], :3, :][:, jac_columns],
+                    point,
+                    max(dist - radius, 0.0),
+                ))
             plan = belief_step.plan_belief_step(
                 normals,
                 contact_jacs,
@@ -259,6 +277,7 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
                 [upper_all],
                 [item[:4] for item in close],
                 axis_std,
+                shells=shells,
             )
             pair_gaps = [
                 {"pair": f"{item[4]}|{item[5]}", "gap_m": float(item[3])} for item in close
@@ -284,9 +303,10 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
                 f"loads={[round(float(v), 3) for v in loads]}",
                 flush=True,
             )
-            if not plan["moved"]:
-                print("no tangential increment inside the inequalities", flush=True)
-                break
+            if float(np.linalg.norm(plan["dq"])) < 1e-8:
+                print("zero increment, keep reading", flush=True)
+                env.step(env.zero_actions())
+                continue
             actions = torch.zeros_like(base.prev_targets)
             write_action(actions, env_id, plan["dq"], base.actuated_dof_indices, action_scale)
             env.step(actions)

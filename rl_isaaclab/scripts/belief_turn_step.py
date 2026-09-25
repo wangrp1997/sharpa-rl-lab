@@ -42,6 +42,10 @@ SHELL_SLACK = 1.0
 NORMAL_BAND = 1.0
 TRACK_WEIGHT = 5.0
 APPROACH_WEIGHT = 0.2
+LEAVE_ROOM = 0.004
+PUSH_FRACTION = 0.5
+PUSH_WEIGHT = 30.0
+FORCE_WEIGHT = 0.02
 
 
 def trust_length(axis_std, step_max=STEP_MAX, sigma_wide=SIGMA_WIDE):
@@ -106,10 +110,11 @@ def plan_belief_step(
 ):
     """Joint increment and object twist. The twist is not measured.
 
-    points[i] is the position of contact i. Pad velocity equals one rigid
-    velocity: J dq = v + ω × r, with r measured from the contact centroid.
-    The cost pulls ω onto the estimated axis. A normal may not separate.
-    Overlap depth is a slack penalty. The cylinder mesh is not an input.
+    points[i] is the position of contact i. Each contact has a nonnegative
+    force. Only a contact that can move along axis × n keeps that force and
+    pushes. A zero-force contact may separate along its normal by LEAVE_ROOM.
+    The planned twist is not applied to the object. Overlap depth is a slack
+    penalty. The cylinder mesh is not an input.
     """
     del watch_distance
     normals = [np.asarray(normal, dtype=np.float64) for normal in normals]
@@ -125,6 +130,7 @@ def plan_belief_step(
         "length": 0.0,
         "moved": [],
         "directions": [None] * len(jacobians),
+        "forces": [0.0] * len(jacobians),
         "enclosed": False,
     }
     axis = _turn.axis_from_normals(normals) if axis is None else np.asarray(axis, dtype=np.float64)
@@ -151,27 +157,21 @@ def plan_belief_step(
     bound_low = np.maximum(lower - q, -max_dq)
     bound_high = np.minimum(upper - q, max_dq)
     n_twist = 6
-    normal_rows = []
-    normal_limits = []
     band = NORMAL_BAND * float(axis_std)
-    track = np.zeros((n_dof, n_dof))
-    track_linear = np.zeros(n_dof)
-    for normal, jac, lever, direction in zip(normals, jacobians, levers, directions):
+    pushers = []
+    for index, (normal, jac, lever, direction) in enumerate(zip(normals, jacobians, levers, directions)):
         unit = normal / max(float(np.linalg.norm(normal)), 1e-9)
-        cross = _skew(lever)
-        block = np.concatenate([jac, -np.eye(3), cross], axis=1)
-        normal_row = unit @ block
-        normal_rows.append(normal_row)
-        normal_rows.append(-normal_row)
-        normal_limits.append(band)
-        normal_limits.append(band)
         if direction is None:
+            pushers.append(None)
             continue
-        desired = np.asarray(direction, dtype=np.float64) * length
-        projector = np.eye(3) - np.outer(unit, unit)
-        weighted = projector @ jac
-        track += weighted.T @ weighted
-        track_linear += weighted.T @ (projector @ desired)
+        tangent = np.asarray(direction, dtype=np.float64)
+        gain = tangent @ jac
+        achievable = 0.0
+        for column, component in enumerate(gain):
+            achievable += max(component * bound_low[column], component * bound_high[column])
+        step_i = min(length, max(achievable, 0.0))
+        pushers.append((index, unit, jac, lever, tangent, gain, step_i))
+    n_force = sum(item is not None for item in pushers)
     overlap_rows = []
     overlap_gaps = []
     for direction, jac_i, jac_j, distance in pairs:
@@ -186,23 +186,56 @@ def plan_belief_step(
         row[:n_dof] = -unit @ (jac_j - jac_i)
         overlap_rows.append(row)
         overlap_gaps.append(gap)
-    n_slack = len(overlap_rows)
-    width = n_dof + n_twist + n_slack
+    n_overlap = len(overlap_rows)
+    width = n_dof + n_twist + n_overlap + n_force
     cost = np.eye(width) * REGULARIZATION
-    cost[:n_dof, :n_dof] += TRACK_WEIGHT * track
     cost[n_dof:n_dof + 3, n_dof:n_dof + 3] = LINEAR_WEIGHT * np.eye(3)
     cost[n_dof + 3:n_dof + 6, n_dof + 3:n_dof + 6] = TWIST_WEIGHT * np.eye(3)
     linear = np.zeros(width)
-    linear[:n_dof] = -TRACK_WEIGHT * track_linear
     linear[n_dof + 3:n_dof + 6] = -TWIST_WEIGHT * axis * angle
-    if n_slack:
-        cost[n_dof + n_twist:, n_dof + n_twist:] = OVERLAP_WEIGHT * np.eye(n_slack)
-    bound_low = np.concatenate([bound_low, np.full(n_twist, -1.0), np.zeros(n_slack)])
-    bound_high = np.concatenate([bound_high, np.full(n_twist, 1.0), np.full(n_slack, 1.0)])
-    gain_rows = [np.concatenate([row, np.zeros(n_slack)]) for row in normal_rows]
-    gain_limits = list(normal_limits)
+    if n_overlap:
+        cost[n_dof + n_twist:n_dof + n_twist + n_overlap, n_dof + n_twist:n_dof + n_twist + n_overlap] = (
+            OVERLAP_WEIGHT * np.eye(n_overlap)
+        )
+    bound_low = np.concatenate([bound_low, np.full(n_twist, -1.0), np.zeros(n_overlap), np.zeros(n_force)])
+    bound_high = np.concatenate([bound_high, np.full(n_twist, 1.0), np.ones(n_overlap), np.ones(n_force)])
+    gain_rows = []
+    gain_limits = []
+    force_slot = 0
+    for item, normal, jac, lever in zip(pushers, normals, jacobians, levers):
+        unit = normal / max(float(np.linalg.norm(normal)), 1e-9)
+        block = np.concatenate([jac, -np.eye(3), _skew(lever)], axis=1)
+        normal_gain = unit @ block
+        penetrate = np.zeros(width)
+        penetrate[:n_dof + n_twist] = -normal_gain
+        gain_rows.append(penetrate)
+        gain_limits.append(band)
+        separate = np.zeros(width)
+        separate[:n_dof + n_twist] = normal_gain
+        if item is None:
+            gain_rows.append(separate)
+            gain_limits.append(band)
+            continue
+        _index, _unit, _jac, _lever, _tangent, gain, step_i = item
+        separate[n_dof + n_twist + n_overlap + force_slot] = LEAVE_ROOM
+        gain_rows.append(separate)
+        gain_limits.append(band + LEAVE_ROOM)
+        upper = np.zeros(width)
+        upper[:n_dof] = gain
+        upper[n_dof + n_twist + n_overlap + force_slot] = -step_i
+        gain_rows.append(upper)
+        gain_limits.append(0.0)
+        lower_push = np.zeros(width)
+        lower_push[:n_dof] = -gain
+        lower_push[n_dof + n_twist + n_overlap + force_slot] = PUSH_FRACTION * step_i
+        gain_rows.append(lower_push)
+        gain_limits.append(0.0)
+        linear[:n_dof] -= PUSH_WEIGHT * gain
+        linear[n_dof + n_twist + n_overlap + force_slot] = FORCE_WEIGHT
+        force_slot += 1
     for index, (row, gap) in enumerate(zip(overlap_rows, overlap_gaps)):
-        padded = np.concatenate([row, np.zeros(n_slack)])
+        padded = np.zeros(width)
+        padded[:n_dof + n_twist] = row
         padded[n_dof + n_twist + index] = -1.0
         gain_rows.append(padded)
         gain_limits.append(gap)
@@ -240,9 +273,18 @@ def plan_belief_step(
     dq = solution[:n_dof]
     linear_velocity = solution[n_dof:n_dof + 3]
     angular = solution[n_dof + 3:n_dof + 6]
+    force_values = np.zeros(len(jacobians))
+    force_slot = 0
     moved = []
-    for index, jac in enumerate(jacobians):
-        if float(np.linalg.norm(jac @ dq)) >= 0.5 * length:
+    for item in pushers:
+        if item is None:
+            continue
+        index, _unit, jac, _lever, tangent, _gain, step_i = item
+        force = float(solution[n_dof + n_twist + n_overlap + force_slot])
+        force_values[index] = force
+        force_slot += 1
+        along = float(tangent @ (jac @ dq))
+        if force > 0.2 and along >= 0.3 * max(step_i, 1e-6):
             moved.append(index)
     return {
         "axis": axis,
@@ -252,6 +294,7 @@ def plan_belief_step(
         "length": length,
         "moved": moved,
         "directions": directions,
+        "forces": force_values.tolist(),
         "enclosed": bool(empty["enclosed"]),
     }
 
@@ -298,7 +341,7 @@ def _check():
     )
     assert tight["enclosed"]
     assert tight["moved"] == [0, 1, 2]
-    assert wide["moved"] == [0, 1, 2]
+    assert max(wide["forces"]) < 0.2
     assert wide["length"] < 0.2 * tight["length"]
     assert abs(float(np.dot(tight["angular"], tight["axis"]))) > 0.5 * np.linalg.norm(tight["angular"])
     assert np.linalg.norm(tight["linear"]) < np.linalg.norm(tight["angular"])

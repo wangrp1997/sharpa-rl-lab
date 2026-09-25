@@ -10,10 +10,14 @@ import argparse
 import importlib.util
 import json
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
-sys.argv = [arg for arg in sys.argv if arg != "--headless"]
+RECORD = "--record" in sys.argv
+sys.argv = [arg for arg in sys.argv if arg not in ("--headless", "--record")]
+if RECORD:
+    sys.argv += ["--viz", "kit"]
 
 from isaaclab.app import AppLauncher
 
@@ -85,6 +89,81 @@ def object_shifts(pads, center, quat, pads0, center0, quat0, fingers):
         rows.append({"finger": NAMES[finger], "shift_m": float(np.linalg.norm(point - start))})
     return rows
 LOG_PATH = Path("logs/live_diag/belief_turn.jsonl")
+VIDEO_PATH = Path("logs/to_delete/belief_turn.mp4")
+
+
+class FrameWriter:
+    """RGB frames to one mp4. The directory name marks the file for deletion."""
+
+    def __init__(self, path, fps=10):
+        self.path = Path(path)
+        self.fps = fps
+        self.proc = None
+        self.count = 0
+
+    def add(self, frame):
+        image = np.ascontiguousarray(frame[:, :, :3])
+        if self.proc is None:
+            height, width = image.shape[:2]
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.proc = subprocess.Popen(
+                [
+                    "ffmpeg", "-y", "-loglevel", "error",
+                    "-f", "rawvideo", "-pix_fmt", "rgb24",
+                    "-s", f"{width}x{height}", "-r", str(self.fps),
+                    "-i", "-",
+                    "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    str(self.path),
+                ],
+                stdin=subprocess.PIPE,
+            )
+        self.proc.stdin.write(image.tobytes())
+        self.count += 1
+
+    def close(self):
+        if self.proc is None:
+            return
+        self.proc.stdin.close()
+        self.proc.wait()
+        self.proc = None
+
+
+def grab_frame(base):
+    """One viewport frame. This Kit build has no replicator, so capture goes through a png."""
+    import os
+    import tempfile
+
+    import imageio.v2 as imageio
+    import omni.kit.app
+    from omni.kit.viewport.utility import capture_viewport_to_file
+
+    for viz in getattr(base.sim, "visualizers", []):
+        viewport = getattr(viz, "_viewport_api", None)
+        if viewport is None:
+            continue
+        handle = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        path = handle.name
+        handle.close()
+        os.remove(path)
+        capture_viewport_to_file(viewport, path)
+        for _ in range(30):
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                image = imageio.imread(path)
+                os.remove(path)
+                return np.ascontiguousarray(image[:, :, :3])
+            omni.kit.app.get_app().update()
+        return None
+    return None
+
+
+def open_capture(eye, target):
+    import omni.replicator.core as rep
+
+    camera = rep.create.camera(position=tuple(eye), look_at=tuple(target))
+    product = rep.create.render_product(camera, (960, 540))
+    annotator = rep.AnnotatorRegistry.get_annotator("rgb", device="cpu")
+    annotator.attach([product])
+    grab_frame.annotator = annotator
 DROP = 0.02
 NEW_POINT = 0.002
 AXIS_STD0 = 0.05
@@ -101,6 +180,39 @@ def pad_forces(base) -> np.ndarray:
 def write_action(actions, env_id, dq, actuated, scale):
     for column, joint_id in enumerate(actuated):
         actions[env_id, joint_id] = float(np.clip(dq[column] / scale, -1.0, 1.0))
+
+
+KEEP_GAP = 0.008
+
+
+def nearest_shell(finger, names, origins, quats, lin, ang, cage, radius):
+    """Sphere on this finger nearest the coarse surface, not the deepest one."""
+    best = None
+    prefix = f"right_{finger}_"
+    for index, name in enumerate(names):
+        if not str(name).startswith(prefix):
+            continue
+        patches = spheres.SPHERES.get(name)
+        if not patches:
+            continue
+        rotation = spheres._rotation(quats[index])
+        for local, rad in patches:
+            offset = rotation @ np.asarray(local, dtype=np.float64)
+            center = np.asarray(origins[index], dtype=np.float64) + offset
+            delta = center - cage
+            dist = float(np.linalg.norm(delta))
+            gap = dist - radius - float(rad)
+            if gap > KEEP_GAP:
+                continue
+            distal = any(token in str(name) for token in ("elastomer", "_DP", "fingertip", "_PP", "_MP"))
+            jac = lin[index] - spheres._skew(offset) @ ang[index]
+            normal = delta / dist if dist > 1e-8 else np.array([0.0, 0.0, 1.0])
+            rank = (1 if distal else 0, gap)
+            if best is None or rank > best[0]:
+                best = (rank, gap, center, normal, jac)
+    if best is None:
+        return None
+    return best[1:]
 
 
 def pads_of(base, env_id):
@@ -160,14 +272,23 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
         return
 
     base.physics_sim_view.set_gravity(carb.Float3(0.0, 0.0, -9.81))
+    env_id = int(base.frozen_env_id)
+    base._focus_env(env_id)
+    print(f"BELIEF grasp env {env_id}", flush=True)
+    video = FrameWriter(VIDEO_PATH) if RECORD else None
+    if video is not None and not any(hasattr(viz, "render_rgb_array") for viz in getattr(base.sim, "visualizers", [])):
+        origin = base.scene.env_origins[env_id]
+        look = (origin + base.object_pos[env_id]).detach().cpu()
+        eye = look + torch.tensor([0.126, 0.125, 0.361])
+        open_capture([float(v) for v in eye.tolist()], [float(v) for v in look.tolist()])
     for _ in range(args_cli.settle_steps):
         if not simulation_app.is_running():
             return
         env.step(env.zero_actions())
-
-    env_id = int(base.frozen_env_id)
-    base._focus_env(env_id)
-    print(f"BELIEF grasp env {env_id}", flush=True)
+        if video is not None:
+            frame = grab_frame(base)
+            if frame is not None:
+                video.add(frame)
 
     dof0 = int(base.hand.num_base_dofs)
     body_offset = 1 if base.hand.is_fixed_base else 0
@@ -214,6 +335,7 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
             point = turn_step.point_in_object(pads0[finger], center0, quat0)
             normal_obj = turn_step.quat_xyzw_to_matrix(quat0).T @ normal
             surface.append((point, normal_obj, finger))
+        last_axis = None
         for step_id in range(args_cli.turn_steps):
             if not simulation_app.is_running():
                 return
@@ -221,8 +343,27 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
             forces = pad_forces(base)[env_id]
             loads = np.linalg.norm(forces, axis=-1)
             center, quat = object_pose(base, env_id)
-            active_now = [i for i in range(5) if float(loads[i]) > empty + noise]
-            held_ok = len(active_now) >= 2 and float(center[2]) >= z0 - DROP
+            jac = base.hand.data.body_link_jacobian_w.torch[env_id].detach().cpu().numpy()
+            names, origins, quats, lin, ang = link_pack(base, env_id, jac_columns, body_offset)
+            pads_before = pads_of(base, env_id)
+            cage = np.mean(pads_before, axis=0)
+            radius = float(np.mean(np.linalg.norm(pads_before - cage, axis=1)))
+            active = []
+            normals = []
+            contact_jacs = []
+            contact_points = []
+            for finger in range(5):
+                shell = nearest_shell(NAMES[finger], names, origins, quats, lin, ang, cage, radius)
+                if shell is None:
+                    continue
+                active.append(finger)
+                if float(loads[finger]) > empty + noise:
+                    normals.append(forces[finger] / np.linalg.norm(forces[finger]))
+                else:
+                    normals.append(shell[2])
+                contact_jacs.append(shell[3])
+                contact_points.append(shell[1])
+            held_ok = len(active) >= 2 and float(center[2]) >= z0 - DROP
             if not held_ok:
                 pads_stop = pads_of(base, env_id)
                 records.append({
@@ -237,28 +378,24 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
                 print(f"stop step {step_id} held={held_ok} z={float(center[2]):.4f}", flush=True)
                 held_ok = False
                 break
-            active = active_now
-            normals = [forces[i] / np.linalg.norm(forces[i]) for i in active]
-            jac = base.hand.data.body_link_jacobian_w.torch[env_id].detach().cpu().numpy()
-            contact_jacs = [jac[elastomer_jac[i], :3, :][:, jac_columns] for i in active]
             q_all = base.hand_dof_pos[env_id].detach().cpu().numpy()[actuated]
             lower_all = base.hand_dof_lower_limits[env_id].detach().cpu().numpy()[actuated]
             upper_all = base.hand_dof_upper_limits[env_id].detach().cpu().numpy()[actuated]
-            names, origins, quats, lin, ang = link_pack(base, env_id, jac_columns, body_offset)
             close = spheres.watch_pairs(
                 names, origins, quats, lin, ang, belief_step.WATCH_DISTANCE
             )
             axis = turn_step.axis_from_normals(normals)
+            if axis is not None and last_axis is not None and float(np.dot(axis, last_axis)) < 0.0:
+                axis = -axis
+            if axis is not None:
+                last_axis = axis
             axis_std = AXIS_STD0 if axis is None else float(np.sqrt(max(axis @ covariance @ axis, 0.0)))
-            pads_before = pads_of(base, env_id)
-            centroid = np.mean(pads_before[active], axis=0)
-            radius = float(np.mean([np.linalg.norm(pads_before[i] - centroid) for i in active]))
             shells = []
             for finger in range(5):
                 if finger in active:
                     continue
                 point = pads_before[finger]
-                delta = point - centroid
+                delta = point - cage
                 dist = float(np.linalg.norm(delta))
                 if dist < 1e-5:
                     continue
@@ -271,7 +408,7 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
             plan = belief_step.plan_belief_step(
                 normals,
                 contact_jacs,
-                [pads_before[i] for i in active],
+                contact_points,
                 [q_all],
                 [lower_all],
                 [upper_all],
@@ -300,16 +437,25 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
             print(
                 f"belief {step_id} pairs={len(close)} length={plan['length']:.5f} "
                 f"std={axis_std:.4f} moved={[NAMES[active[i]] for i in plan['moved']]} "
+                f"force={[round(plan['forces'][i], 2) for i in range(len(active))]} "
                 f"loads={[round(float(v), 3) for v in loads]}",
                 flush=True,
             )
             if float(np.linalg.norm(plan["dq"])) < 1e-8:
                 print("zero increment, keep reading", flush=True)
                 env.step(env.zero_actions())
+                if video is not None:
+                    frame = grab_frame(base)
+                    if frame is not None:
+                        video.add(frame)
                 continue
             actions = torch.zeros_like(base.prev_targets)
             write_action(actions, env_id, plan["dq"], base.actuated_dof_indices, action_scale)
             env.step(actions)
+            if video is not None:
+                frame = grab_frame(base)
+                if frame is not None:
+                    video.add(frame)
             if axis is not None:
                 mean, covariance = belief_step.update_belief(mean, covariance, axis, 0.0, 1e-4)
             base._refresh_lab()
@@ -389,6 +535,10 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
         for row in records:
             handle.write(json.dumps(row) + "\n")
     print(f"wrote {LOG_PATH}", flush=True)
+    if video is not None:
+        video.close()
+        print(f"wrote {VIDEO_PATH} frames={video.count}", flush=True)
+        return
     while simulation_app.is_running():
         env.step(env.zero_actions())
 

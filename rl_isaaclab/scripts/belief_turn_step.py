@@ -69,6 +69,370 @@ def update_belief(mean, covariance, direction, measurement, meas_var):
     return mean, covariance
 
 
+def _tangent_basis(normal):
+    unit = np.asarray(normal, dtype=np.float64)
+    unit = unit / max(float(np.linalg.norm(unit)), 1e-9)
+    helper = np.array([1.0, 0.0, 0.0]) if abs(float(unit[0])) < 0.9 else np.array([0.0, 1.0, 0.0])
+    first = np.cross(unit, helper)
+    first = first / max(float(np.linalg.norm(first)), 1e-9)
+    second = np.cross(unit, first)
+    return first, second
+
+
+def _overlap_rows(pairs):
+    rows = []
+    gaps = []
+    for pair_dir, jac_i, jac_j, distance in pairs:
+        gap = float(distance)
+        if gap > 0.0:
+            continue
+        unit = np.asarray(pair_dir, dtype=np.float64)
+        unit = unit / max(float(np.linalg.norm(unit)), 1e-9)
+        rows.append(-unit @ (np.asarray(jac_j, dtype=np.float64) - np.asarray(jac_i, dtype=np.float64)))
+        gaps.append(gap)
+    return rows, gaps
+
+
+def support_holds(points, center, radius):
+    """True when remaining contacts still surround the object center.
+
+    Sundaralingam and Hermans, ICRA 2018, Section III, move one finger only
+    while the other fingers keep the object. The paper requires the object
+    mesh, the hand kinematics, an initial grasp, and a desired grasp, and
+    it chooses the finger in an outer sequence. This test uses the mesh
+    radius and the pose center. It does not run that sequence.
+    """
+    pts = [np.asarray(point, dtype=np.float64) for point in points]
+    if len(pts) < 2:
+        return False
+    center = np.asarray(center, dtype=np.float64)
+    flat = np.array([[point[0] - center[0], point[1] - center[1]] for point in pts])
+    if len(pts) == 2:
+        start, end = flat
+        edge = end - start
+        weight = float(np.clip(-(start @ edge) / (float(edge @ edge) + 1e-12), 0.0, 1.0))
+        return float(np.linalg.norm(start + weight * edge)) <= float(radius)
+    result = linprog(
+        np.zeros(len(pts)),
+        A_eq=np.vstack((flat.T, np.ones(len(pts)))),
+        b_eq=np.zeros(3),
+        bounds=[(0.0, None)] * len(pts),
+        method="highs",
+    )
+    return bool(result.success)
+
+
+def plan_rigid_step(
+    jacobians,
+    radii,
+    normals,
+    stay,
+    directions,
+    axis,
+    joints,
+    lowers,
+    uppers,
+    pairs,
+    max_dq=MAX_DQ,
+    object_shift=None,
+):
+    """One damped step whose contacting fingers share a rigid twist.
+
+    Escande, Mansard, and Wieber, IJRR 2014, solve a hierarchy: a lower
+    task is optimized only inside the set that keeps higher tasks at the
+    value already achieved. Their MATLAB solver and the quadprog port are
+    not used. Two osqp solves follow that order. The first minimizes the
+    contact mismatch. The second minimizes the joint increment without
+    letting that mismatch grow. Inequalities stay in both solves.
+
+    The paper requires a stack of quadratic tasks and linear inequalities,
+    and it assumes the higher-priority optimum can be held exactly. Joint
+    torque, a full inverse-dynamics model, and their equality-cascade
+    solver are not required here.
+
+    Sundaralingam and Hermans, ICRA 2018, keep the current contact points
+    fixed in the object frame while the object takes one rigid velocity.
+    That in-grasp condition is J dq = v + ω × r at each holding pad.
+    v and ω are decision variables and are not applied to the simulated
+    object. A pad that is not holding falls back to a point on the mesh
+    one small angle ahead; the solver does not name that finger.
+
+    The paper requires the object mesh, the hand kinematics, an initial
+    grasp, and a desired grasp. It also plans collision-free joint paths
+    and moves one finger at a time while the others stay fixed. Those
+    gait sequences and the desired grasp are not inputs. The public
+    in-grasp code keeps every contact and does not break contact.
+    """
+    jacobians = [np.asarray(jac, dtype=np.float64) for jac in jacobians]
+    n_dof = int(jacobians[0].shape[1]) if jacobians else 0
+    axis = np.asarray(axis, dtype=np.float64)
+    axis = axis / max(float(np.linalg.norm(axis)), 1e-9)
+    zeros = np.zeros(n_dof, dtype=np.float64)
+    empty = {
+        "dq": zeros,
+        "directions": list(directions),
+        "moved": [],
+        "stay": [bool(v) for v in stay],
+        "linear": np.zeros(3),
+        "angular": np.zeros(3),
+    }
+    if n_dof == 0 or not jacobians:
+        return empty
+    q = np.concatenate([np.asarray(block, dtype=np.float64).reshape(-1) for block in joints])
+    lower = np.concatenate([np.asarray(block, dtype=np.float64).reshape(-1) for block in lowers])
+    upper = np.concatenate([np.asarray(block, dtype=np.float64).reshape(-1) for block in uppers])
+    bound_low = np.maximum(lower - q, -max_dq)
+    bound_high = np.minimum(upper - q, max_dq)
+    overlap_rows, overlap_gaps = _overlap_rows(pairs)
+    n_fingers = len(jacobians)
+    n_overlap = len(overlap_rows)
+    # dq | v | ω | leave slack per finger | overlap slack
+    width = n_dof + 6 + n_fingers + n_overlap
+    twist_v = n_dof
+    twist_w = n_dof + 3
+    leave0 = n_dof + 6
+    overlap0 = leave0 + n_fingers
+
+    def pack():
+        cost = np.eye(width) * 0.05
+        cost[twist_v:leave0, twist_v:leave0] = np.eye(6)
+        span = np.maximum(upper - lower, 1e-6)
+        margin = np.minimum(q - lower, upper - q) / span
+        for index, room in enumerate(margin):
+            # Fan, Tang, Lin, Zhao, and Tomizuka, arXiv:1710.10350, treat a
+            # joint near its limit as less able to keep the grasp. Their
+            # planner then picks which finger to lift. That choice is not
+            # made here; the same limit distance only increases damping.
+            # The paper requires the remaining contacts' convex hull and a
+            # finger-lift search outside the solver.
+            cost[index, index] += 1.0 / max(float(room), 0.05)
+        linear = np.zeros(width)
+        if object_shift is None:
+            linear[twist_w:twist_w + 3] = -0.05 * axis
+        else:
+            # Move the cylinder toward pads that are not yet on the mesh.
+            # The pose supplies the center and the mesh supplies the surface
+            # point. Sundaralingam and Hermans, ICRA 2018, require the mesh
+            # and the hand kinematics before a finger is lifted. Contact is
+            # established first; v is not written onto the simulated object.
+            shift = np.asarray(object_shift, dtype=np.float64)
+            linear[twist_v:twist_v + 3] = -shift
+        rows = []
+        limits = []
+        match_rows = []
+        for finger, (jac, radius, normal, holding, direction) in enumerate(
+            zip(jacobians, radii, normals, stay, directions)
+        ):
+            unit = np.asarray(normal, dtype=np.float64)
+            unit = unit / max(float(np.linalg.norm(unit)), 1e-9)
+            if holding:
+                lever = np.asarray(radius, dtype=np.float64)
+                for tangent in _tangent_basis(unit):
+                    match = np.zeros(width)
+                    match[:n_dof] = tangent @ jac
+                    match[twist_v:twist_v + 3] = -tangent
+                    match[twist_w:twist_w + 3] = tangent @ _skew(lever)
+                    match_rows.append(match)
+                    cost += 800.0 * np.outer(match, match)
+                penetrate = np.zeros(width)
+                penetrate[:n_dof] = -unit @ jac
+                rows.append(penetrate)
+                limits.append(4e-4)
+                separate = np.zeros(width)
+                separate[:n_dof] = unit @ jac
+                separate[leave0 + finger] = -1.0
+                rows.append(separate)
+                limits.append(4e-4)
+                cost[leave0 + finger, leave0 + finger] = 40.0
+            elif direction is not None:
+                tangent = np.asarray(direction, dtype=np.float64)
+                tangent = tangent / max(float(np.linalg.norm(tangent)), 1e-9)
+                gain = tangent @ jac
+                linear[:n_dof] -= 0.02 * gain
+                cap = np.zeros(width)
+                cap[:n_dof] = gain
+                rows.append(cap)
+                limits.append(0.002)
+        for index, (row, gap) in enumerate(zip(overlap_rows, overlap_gaps)):
+            padded = np.zeros(width)
+            padded[:n_dof] = row
+            padded[overlap0 + index] = -1.0
+            rows.append(padded)
+            limits.append(gap)
+            cost[overlap0 + index, overlap0 + index] = OVERLAP_WEIGHT
+        spin = 0.0 if object_shift is not None else 0.2
+        low = np.concatenate([
+            bound_low,
+            np.full(3, -0.005),
+            np.full(3, -spin),
+            np.zeros(n_fingers + n_overlap),
+        ])
+        high = np.concatenate([
+            bound_high,
+            np.full(3, 0.005),
+            np.full(3, spin),
+            np.full(n_fingers, 0.01),
+            np.ones(n_overlap),
+        ])
+        return cost, linear, rows, limits, low, high, match_rows
+
+    cost, linear, rows, limits, low, high, match_rows = pack()
+    if not rows and not match_rows:
+        return empty
+
+    def solve(cost_matrix, linear_term, extra_rows, extra_limits):
+        ineq = rows + extra_rows
+        bound = limits + extra_limits
+        if not ineq:
+            return None
+        return solve_qp(
+            cost_matrix,
+            linear_term,
+            np.vstack(ineq),
+            np.asarray(bound, dtype=np.float64),
+            None,
+            None,
+            lb=low,
+            ub=high,
+            solver="osqp",
+            eps_abs=1e-8,
+            eps_rel=1e-8,
+            max_iter=10000,
+            polish=True,
+            verbose=False,
+        )
+
+    first = solve(cost, linear, [], [])
+    if first is None:
+        return empty
+    solution = np.asarray(first, dtype=np.float64)
+    dq = solution[:n_dof]
+    linear_v = solution[twist_v:twist_v + 3]
+    angular = solution[twist_w:twist_w + 3]
+    moved = []
+    for index, (jac, radius, normal, holding, direction) in enumerate(
+        zip(jacobians, radii, normals, stay, directions)
+    ):
+        if holding:
+            unit = np.asarray(normal, dtype=np.float64)
+            unit = unit / max(float(np.linalg.norm(unit)), 1e-9)
+            tangent = np.cross(axis, unit)
+            tangent_norm = float(np.linalg.norm(tangent))
+            if tangent_norm < 1e-8:
+                continue
+            tangent = tangent / tangent_norm
+            along = float(tangent @ (jac @ dq))
+            wanted = abs(float(tangent @ np.cross(angular, radius)))
+            if along >= max(0.3 * wanted, 1e-5):
+                moved.append(index)
+        elif direction is not None:
+            tangent = np.asarray(direction, dtype=np.float64)
+            tangent = tangent / max(float(np.linalg.norm(tangent)), 1e-9)
+            if float(tangent @ (jac @ dq)) > 2e-4:
+                moved.append(index)
+    empty["dq"] = dq
+    empty["moved"] = moved
+    empty["linear"] = linear_v
+    empty["angular"] = angular
+    return empty
+
+
+def plan_mesh_step(jacobians, directions, normals, stay, joints, lowers, uppers, pairs, step=0.002, max_dq=MAX_DQ):
+    """Joint increment along mesh tangents. No palm target and no unused twist."""
+    jacobians = [np.asarray(jac, dtype=np.float64) for jac in jacobians]
+    n_dof = int(jacobians[0].shape[1]) if jacobians else 0
+    zeros = np.zeros(n_dof, dtype=np.float64)
+    empty = {"dq": zeros, "directions": list(directions), "moved": [], "stay": [bool(v) for v in stay]}
+    if n_dof == 0:
+        return empty
+    q = np.concatenate([np.asarray(block, dtype=np.float64).reshape(-1) for block in joints])
+    lower = np.concatenate([np.asarray(block, dtype=np.float64).reshape(-1) for block in lowers])
+    upper = np.concatenate([np.asarray(block, dtype=np.float64).reshape(-1) for block in uppers])
+    bound_low = np.maximum(lower - q, -max_dq)
+    bound_high = np.minimum(upper - q, max_dq)
+    overlap_rows = []
+    overlap_gaps = []
+    for pair_dir, jac_i, jac_j, distance in pairs:
+        gap = float(distance)
+        if gap > 0.0:
+            continue
+        unit = np.asarray(pair_dir, dtype=np.float64)
+        unit = unit / max(float(np.linalg.norm(unit)), 1e-9)
+        row = -unit @ (np.asarray(jac_j, dtype=np.float64) - np.asarray(jac_i, dtype=np.float64))
+        overlap_rows.append(row)
+        overlap_gaps.append(gap)
+    n_overlap = len(overlap_rows)
+    width = n_dof + n_overlap
+    cost = np.eye(width) * REGULARIZATION
+    linear = np.zeros(width)
+    gain_rows = []
+    gain_limits = []
+    if np.ndim(step) == 0:
+        targets = [float(step)] * len(jacobians)
+    else:
+        targets = [float(value) for value in step]
+    for jac, direction, normal, holding, target in zip(jacobians, directions, normals, stay, targets):
+        if direction is None:
+            continue
+        tangent = np.asarray(direction, dtype=np.float64)
+        tangent = tangent / max(float(np.linalg.norm(tangent)), 1e-9)
+        gain = tangent @ jac
+        cost[:n_dof, :n_dof] += PUSH_WEIGHT * np.outer(gain, gain)
+        linear[:n_dof] -= PUSH_WEIGHT * target * gain
+        if not holding:
+            continue
+        unit = np.asarray(normal, dtype=np.float64)
+        unit = unit / max(float(np.linalg.norm(unit)), 1e-9)
+        normal_gain = unit @ jac
+        positive = np.zeros(width)
+        positive[:n_dof] = normal_gain
+        gain_rows.append(positive)
+        gain_rows.append(-positive)
+        gain_limits.extend((4e-4, 4e-4))
+    for index, (row, gap) in enumerate(zip(overlap_rows, overlap_gaps)):
+        padded = np.zeros(width)
+        padded[:n_dof] = row
+        padded[n_dof + index] = -1.0
+        gain_rows.append(padded)
+        gain_limits.append(gap)
+        cost[n_dof + index, n_dof + index] = OVERLAP_WEIGHT
+    bound_low = np.concatenate([bound_low, np.zeros(n_overlap)])
+    bound_high = np.concatenate([bound_high, np.ones(n_overlap)])
+    if not gain_rows:
+        return empty
+    solution = solve_qp(
+        cost,
+        linear,
+        np.vstack(gain_rows),
+        np.asarray(gain_limits, dtype=np.float64),
+        None,
+        None,
+        lb=bound_low,
+        ub=bound_high,
+        solver="osqp",
+        eps_abs=1e-8,
+        eps_rel=1e-8,
+        max_iter=10000,
+        polish=True,
+        verbose=False,
+    )
+    if solution is None:
+        return empty
+    dq = np.asarray(solution[:n_dof], dtype=np.float64)
+    moved = []
+    for index, (jac, direction) in enumerate(zip(jacobians, directions)):
+        if direction is None:
+            continue
+        tangent = np.asarray(direction, dtype=np.float64)
+        tangent = tangent / max(float(np.linalg.norm(tangent)), 1e-9)
+        asked = targets[index] if index < len(targets) else step
+        if float(tangent @ (jac @ dq)) >= 0.3 * float(asked):
+            moved.append(index)
+    empty["dq"] = dq
+    empty["moved"] = moved
+    return empty
+
+
 def _skew(vector):
     x, y, z = (float(v) for v in vector)
     return np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]], dtype=np.float64)
@@ -365,6 +729,38 @@ def _check():
         normals, jacobians, points, joints, locked_lower, locked_upper, [], axis_std=SIGMA_WIDE
     )
     assert 1 not in locked["moved"]
+    jac_a = np.zeros((3, 4))
+    jac_a[1, 0] = 1.0
+    jac_a[0, 1] = 1.0
+    jac_b = np.zeros((3, 4))
+    jac_b[1, 2] = -1.0
+    jac_b[0, 3] = 1.0
+    radius = 0.02
+    rigid = plan_rigid_step(
+        [jac_a, jac_b],
+        [np.array([radius, 0.0, 0.0]), np.array([-radius, 0.0, 0.0])],
+        [np.array([1.0, 0.0, 0.0]), np.array([-1.0, 0.0, 0.0])],
+        [True, True],
+        [np.array([0.0, 1.0, 0.0]), np.array([0.0, -1.0, 0.0])],
+        np.array([0.0, 0.0, 1.0]),
+        [np.zeros(4)],
+        [np.full(4, -1.0)],
+        [np.full(4, 1.0)],
+        [],
+    )
+    assert float(rigid["dq"][0]) > 1e-4
+    assert float(rigid["dq"][2]) > 1e-4
+    assert abs(float(rigid["dq"][1])) < 0.5 * float(rigid["dq"][0])
+    assert abs(float(rigid["dq"][3])) < 0.5 * float(rigid["dq"][2])
+    assert abs(float(rigid["angular"][2])) > abs(float(rigid["angular"][0]))
+    held = [np.array([0.02, 0.0, 0.0]), np.array([-0.02, 0.0, 0.0])]
+    assert support_holds(held, np.zeros(3), 0.02)
+    assert not support_holds([np.array([0.02, 0.0, 0.0])], np.zeros(3), 0.02)
+    assert not support_holds(
+        [np.array([0.02, 0.02, 0.0]), np.array([0.02, -0.02, 0.0])],
+        np.zeros(3),
+        0.005,
+    )
     mean = np.zeros(3)
     covariance = np.eye(3)
     updated, tightened = update_belief(mean, covariance, [0.0, 0.0, 1.0], 0.0, 1e-4)

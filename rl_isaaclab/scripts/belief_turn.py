@@ -57,6 +57,7 @@ turn_step = _load("tangent_turn_step.py")
 belief_step = _load("belief_turn_step.py")
 spheres = _load("link_spheres.py")
 hold_step = _load("stable_hold_step.py")
+shift_step = _load("reach_shift_step.py")
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -167,6 +168,33 @@ def open_capture(eye, target):
 DROP = 0.02
 NEW_POINT = 0.002
 AXIS_STD0 = 0.05
+MESH_RADIUS, MESH_HALF = shift_step.cylinder_size(0.5)
+AHEAD = 0.15
+
+
+def correct_center(center, axis, pads, loaded, radius):
+    """Move the cylinder axis so loaded pads sit on the surface."""
+    center = np.asarray(center, dtype=np.float64).copy()
+    axis = np.asarray(axis, dtype=np.float64)
+    axis = axis / max(float(np.linalg.norm(axis)), 1e-9)
+    for _ in range(4):
+        rows = []
+        residual = []
+        for pad, holding in zip(pads, loaded):
+            if not holding:
+                continue
+            radial = pad - center
+            radial = radial - float(np.dot(radial, axis)) * axis
+            norm = float(np.linalg.norm(radial))
+            if norm < 1e-6:
+                continue
+            rows.append(-radial / norm)
+            residual.append(norm - radius)
+        if not rows:
+            break
+        delta, *_ = np.linalg.lstsq(np.vstack(rows), -np.asarray(residual), rcond=None)
+        center = center + delta
+    return center
 
 
 def pad_forces(base) -> np.ndarray:
@@ -335,7 +363,9 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
             point = turn_step.point_in_object(pads0[finger], center0, quat0)
             normal_obj = turn_step.quat_xyzw_to_matrix(quat0).T @ normal
             surface.append((point, normal_obj, finger))
-        last_axis = None
+        last_axis = shift_step.cylinder_axis(quat0)
+        pose_hat = (center0.copy(), last_axis.copy())
+        pose_rng = np.random.default_rng(0)
         for step_id in range(args_cli.turn_steps):
             if not simulation_app.is_running():
                 return
@@ -346,24 +376,90 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
             jac = base.hand.data.body_link_jacobian_w.torch[env_id].detach().cpu().numpy()
             names, origins, quats, lin, ang = link_pack(base, env_id, jac_columns, body_offset)
             pads_before = pads_of(base, env_id)
-            cage = np.mean(pads_before, axis=0)
-            radius = float(np.mean(np.linalg.norm(pads_before - cage, axis=1)))
-            active = []
+            loaded_now = [float(loads[finger]) > empty + noise for finger in range(5)]
+            if step_id % 3 == 2:
+                center_hat, axis_hat = pose_hat
+                vision = False
+            else:
+                axis_hat = shift_step.cylinder_axis(quat)
+                axis_hat = shift_step._rodrigues(pose_rng.normal(0.0, 0.05, 3)) @ axis_hat
+                center_hat = center + pose_rng.normal(0.0, 0.002, 3)
+                vision = True
+            center_hat = correct_center(center_hat, axis_hat, pads_before, loaded_now, MESH_RADIUS)
+            pose_hat = (center_hat, axis_hat)
+            active = list(range(5))
             normals = []
             contact_jacs = []
             contact_points = []
+            directions = []
+            stay = []
+            radii = []
             for finger in range(5):
-                shell = nearest_shell(NAMES[finger], names, origins, quats, lin, ang, cage, radius)
-                if shell is None:
-                    continue
-                active.append(finger)
-                if float(loads[finger]) > empty + noise:
-                    normals.append(forces[finger] / np.linalg.norm(forces[finger]))
+                pad = pads_before[finger]
+                pad_jac = jac[elastomer_jac[finger], :3, :][:, jac_columns]
+                mesh_point = shift_step.closest_on_cylinder(pad, center_hat, axis_hat, MESH_RADIUS, MESH_HALF)
+                radial = mesh_point - center_hat
+                radial = radial - float(np.dot(radial, axis_hat)) * axis_hat
+                radial_norm = float(np.linalg.norm(radial))
+                normal = radial / radial_norm if radial_norm > 1e-8 else axis_hat
+                holding = bool(loaded_now[finger])
+                stay.append(holding)
+                radii.append(pad - center_hat)
+                if holding:
+                    directions.append(None)
                 else:
-                    normals.append(shell[2])
-                contact_jacs.append(shell[3])
-                contact_points.append(shell[1])
-            held_ok = len(active) >= 2 and float(center[2]) >= z0 - DROP
+                    delta = mesh_point - pad
+                    delta_norm = float(np.linalg.norm(delta))
+                    tangent = np.cross(axis_hat, normal)
+                    tangent_norm = float(np.linalg.norm(tangent))
+                    tangent = tangent / tangent_norm if tangent_norm > 1e-8 else normal
+                    directions.append(delta / delta_norm if delta_norm > 1e-8 else tangent)
+                normals.append(normal)
+                contact_jacs.append(pad_jac)
+                contact_points.append(mesh_point)
+            release = None
+            object_shift = None
+            open_fingers = [finger for finger in range(5) if not stay[finger]]
+            if open_fingers:
+                nearest_gap = None
+                nearest_norm = None
+                for finger in open_fingers:
+                    gap = pads_before[finger] - contact_points[finger]
+                    gap = gap - float(np.dot(gap, axis_hat)) * axis_hat
+                    gap_norm = float(np.linalg.norm(gap))
+                    if nearest_norm is None or gap_norm < nearest_norm:
+                        nearest_gap = gap
+                        nearest_norm = gap_norm
+                if nearest_gap is not None and nearest_norm > 0.004:
+                    object_shift = nearest_gap / nearest_norm * min(0.0015, nearest_norm)
+            candidates = []
+            for finger in range(5):
+                if open_fingers or not stay[finger]:
+                    continue
+                others = [pads_before[other] for other in range(5) if stay[other] and other != finger]
+                if len(others) < 3 or not belief_step.support_holds(others, center_hat, MESH_RADIUS):
+                    continue
+                tangent = np.cross(axis_hat, normals[finger])
+                tangent_norm = float(np.linalg.norm(tangent))
+                if tangent_norm < 1e-8:
+                    continue
+                gain = (tangent / tangent_norm) @ contact_jacs[finger]
+                reachable = 0.0
+                for component in gain:
+                    reachable += max(component * -belief_step.MAX_DQ, component * belief_step.MAX_DQ)
+                candidates.append((reachable, finger))
+            if candidates:
+                release = min(candidates)[1]
+                normal = normals[release]
+                landing = pads_before[release] + normal * 0.003
+                delta = landing - pads_before[release]
+                delta_norm = float(np.linalg.norm(delta))
+                tangent = np.cross(axis_hat, normal)
+                tangent_norm = float(np.linalg.norm(tangent))
+                tangent = tangent / tangent_norm if tangent_norm > 1e-8 else normal
+                directions[release] = delta / delta_norm if delta_norm > 1e-8 else tangent
+                stay[release] = False
+            held_ok = sum(loaded_now) >= 2 and float(center[2]) >= z0 - DROP
             if not held_ok:
                 pads_stop = pads_of(base, env_id)
                 records.append({
@@ -384,38 +480,27 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
             close = spheres.watch_pairs(
                 names, origins, quats, lin, ang, belief_step.WATCH_DISTANCE
             )
-            axis = turn_step.axis_from_normals(normals)
-            if axis is not None and last_axis is not None and float(np.dot(axis, last_axis)) < 0.0:
+            axis = axis_hat
+            if last_axis is not None and float(np.dot(axis, last_axis)) < 0.0:
                 axis = -axis
-            if axis is not None:
-                last_axis = axis
-            axis_std = AXIS_STD0 if axis is None else float(np.sqrt(max(axis @ covariance @ axis, 0.0)))
-            shells = []
-            for finger in range(5):
-                if finger in active:
-                    continue
-                point = pads_before[finger]
-                delta = point - cage
-                dist = float(np.linalg.norm(delta))
-                if dist < 1e-5:
-                    continue
-                shells.append((
-                    delta / dist,
-                    jac[elastomer_jac[finger], :3, :][:, jac_columns],
-                    point,
-                    max(dist - radius, 0.0),
-                ))
-            plan = belief_step.plan_belief_step(
-                normals,
+            last_axis = axis
+            plan = belief_step.plan_rigid_step(
                 contact_jacs,
-                contact_points,
+                radii,
+                normals,
+                stay,
+                directions,
+                axis,
                 [q_all],
                 [lower_all],
                 [upper_all],
                 [item[:4] for item in close],
-                axis_std,
-                shells=shells,
+                object_shift=object_shift,
             )
+            plan["forces"] = [1.0 if holding else 0.0 for holding in stay]
+            plan["length"] = float(np.linalg.norm(np.cross(plan["angular"], radii[0])))
+            plan["enclosed"] = bool(sum(stay) >= 2)
+            axis_std = float(np.sqrt(max(axis @ covariance @ axis, 0.0)))
             pair_gaps = [
                 {"pair": f"{item[4]}|{item[5]}", "gap_m": float(item[3])} for item in close
             ]
@@ -438,6 +523,8 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
                 f"belief {step_id} pairs={len(close)} length={plan['length']:.5f} "
                 f"std={axis_std:.4f} moved={[NAMES[active[i]] for i in plan['moved']]} "
                 f"force={[round(plan['forces'][i], 2) for i in range(len(active))]} "
+                f"vision={int(vision)} release={NAMES[release] if release is not None else '-'} "
+                f"shift={0.0 if object_shift is None else float(np.linalg.norm(object_shift)):.4f} "
                 f"loads={[round(float(v), 3) for v in loads]}",
                 flush=True,
             )
@@ -456,8 +543,15 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
                 frame = grab_frame(base)
                 if frame is not None:
                     video.add(frame)
-            if axis is not None:
-                mean, covariance = belief_step.update_belief(mean, covariance, axis, 0.0, 1e-4)
+            gaps = []
+            for finger, holding in enumerate(loaded_now):
+                if not holding:
+                    continue
+                rel = pads_before[finger] - center_hat
+                radial = rel - float(np.dot(rel, axis)) * axis
+                gaps.append(float(np.linalg.norm(radial)) - MESH_RADIUS)
+            measured = float(np.mean(gaps)) if gaps else 0.0
+            mean, covariance = belief_step.update_belief(mean, covariance, axis, measured, 1e-4)
             base._refresh_lab()
             pads = pads_of(base, env_id)
             forces_after = pad_forces(base)[env_id]
@@ -538,9 +632,7 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
     if video is not None:
         video.close()
         print(f"wrote {VIDEO_PATH} frames={video.count}", flush=True)
-        return
-    while simulation_app.is_running():
-        env.step(env.zero_actions())
+    return
 
 
 if __name__ == "__main__":

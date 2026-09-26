@@ -39,4 +39,25 @@ cp -a "${MESH_SRC}/wave_01/right_sharpa_wave/meshes" "${DEST}/models/right_sharp
 cp "${ROOT}/assets/SharpaWave/right_sharpa_wave.urdf" \
   "${DEST}/models/right_sharpa_wave/right_sharpa_wave.urdf"
 
+# GitHub's release CDN is too slow from here. Drake publishes the same tarball.
+DRAKE_TGZ="${DEST}/drake-1.30.0-jammy.tar.gz"
+if [[ ! -f "${DRAKE_TGZ}" ]]; then
+  curl -L --fail --retry 3 -o "${DRAKE_TGZ}" \
+    https://drake-packages.csail.mit.edu/drake/release/drake-1.30.0-jammy.tar.gz
+fi
+python3 - << PY
+from pathlib import Path
+path = Path("${DEST}") / "Dockerfile"
+text = path.read_text()
+old = """RUN wget https://github.com/RobotLocomotion/drake/releases/download/v1.30.0/drake-1.30.0-jammy.tar.gz && \\\\
+    tar -xvzf drake-1.30.0-jammy.tar.gz && \\\\
+    rm drake-1.30.0-jammy.tar.gz"""
+new = """COPY drake-1.30.0-jammy.tar.gz /tmp/drake-1.30.0-jammy.tar.gz
+RUN tar -xvzf /tmp/drake-1.30.0-jammy.tar.gz -C /home && \\\\
+    rm /tmp/drake-1.30.0-jammy.tar.gz"""
+if old not in text:
+    raise SystemExit("Dockerfile wget step not found")
+path.write_text(text.replace(old, new, 1))
+PY
+
 echo "prepared ${DEST}"

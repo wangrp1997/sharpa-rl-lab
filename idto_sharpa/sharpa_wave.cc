@@ -1,6 +1,7 @@
 #include "examples/example_base.h"
 
 #include <array>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -98,7 +99,17 @@ void AddSharpaScene(MultibodyPlant<double>* plant, bool for_simulation) {
 
   const std::string urdf =
       FindIdtoResource("idto/models/right_sharpa_wave/right_sharpa_wave.urdf");
-  Parser(plant).AddModels(urdf);
+  Parser parser(plant);
+  parser.package_map().AddPackageXml(
+      FindIdtoResource("idto/models/right_sharpa_wave/package.xml"));
+  parser.AddModels(urdf);
+  for (drake::multibody::JointIndex index{0}; index < plant->num_joints(); ++index) {
+    const drake::multibody::Joint<double>& joint = plant->get_joint(index);
+    if (joint.num_velocities() != 1) {
+      continue;
+    }
+    plant->AddJointActuator(joint.name() + "_act", joint, 3.3);
+  }
   const Quaterniond q_hand(0.819152, 0.0, -0.5735764, 0.0);
   const RigidTransformd X_hand(RotationMatrixd(q_hand), Vector3d(0.0, 0.0, 0.5));
   plant->WeldFrames(plant->world_frame(), plant->GetFrameByName("right_hand_C_MC"),
@@ -173,17 +184,21 @@ class SharpaWaveExample : public TrajOptExample {
 
 int main(int argc, char* argv[]) {
   gflags::ParseCommandLineFlags(&argc, &argv, true);
+  try {
+    {
+      drake::multibody::MultibodyPlant<double> plant(0.0);
+      drake::geometry::SceneGraph<double> scene_graph;
+      plant.RegisterAsSourceForSceneGraph(&scene_graph);
+      idto::examples::sharpa_wave::AddSharpaScene(&plant, false);
+      plant.Finalize();
+      idto::examples::sharpa_wave::CheckPositionOrder(plant);
+    }
 
-  {
-    drake::multibody::MultibodyPlant<double> plant(0.0);
-    drake::geometry::SceneGraph<double> scene_graph;
-    plant.RegisterAsSourceForSceneGraph(&scene_graph);
-    idto::examples::sharpa_wave::AddSharpaScene(&plant, false);
-    plant.Finalize();
-    idto::examples::sharpa_wave::CheckPositionOrder(plant);
+    idto::examples::sharpa_wave::SharpaWaveExample example;
+    example.RunExample("idto/examples/sharpa_wave/sharpa_wave.yaml", FLAGS_test);
+  } catch (const std::exception& error) {
+    std::cerr << error.what() << std::endl;
+    return 1;
   }
-
-  idto::examples::sharpa_wave::SharpaWaveExample example;
-  example.RunExample("idto/examples/sharpa_wave/sharpa_wave.yaml", FLAGS_test);
   return 0;
 }

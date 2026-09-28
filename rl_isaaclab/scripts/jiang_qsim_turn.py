@@ -85,9 +85,175 @@ def actuated_position(base, env_id):
     return position
 
 
+# Planners index joints in URDF order. Isaac's articulation order is different.
+PLANNER_JOINTS = [
+    "right_thumb_CMC_FE",
+    "right_thumb_CMC_AA",
+    "right_thumb_MCP_FE",
+    "right_thumb_MCP_AA",
+    "right_thumb_IP",
+    "right_index_MCP_FE",
+    "right_index_MCP_AA",
+    "right_index_PIP",
+    "right_index_DIP",
+    "right_middle_MCP_FE",
+    "right_middle_MCP_AA",
+    "right_middle_PIP",
+    "right_middle_DIP",
+    "right_ring_MCP_FE",
+    "right_ring_MCP_AA",
+    "right_ring_PIP",
+    "right_ring_DIP",
+    "right_pinky_CMC",
+    "right_pinky_MCP_FE",
+    "right_pinky_MCP_AA",
+    "right_pinky_PIP",
+    "right_pinky_DIP",
+]
+
+
+def planner_slots(joint_names):
+    names = list(joint_names)
+    return [names.index(name) for name in PLANNER_JOINTS]
+
+
+def to_planner(q_isaac, slots):
+    return np.asarray(q_isaac, dtype=float)[np.asarray(slots, dtype=int)]
+
+
+def to_isaac(q_planner, slots, size):
+    out = np.zeros(size, dtype=float)
+    out[np.asarray(slots, dtype=int)] = np.asarray(q_planner, dtype=float)
+    return out
+
+
 def targets_to_actions(q_des, prev, scale, lower, upper):
     q_des = torch.maximum(torch.minimum(q_des, upper), lower)
     return ((q_des - prev) / scale).clamp(-1.0, 1.0)
+
+
+# Positive flexion closes on this hand. Indices are the planner's URDF order.
+FLEXION = {
+    0: (0, 2, 4),
+    1: (5, 7, 8),
+    2: (9, 11, 12),
+    3: (13, 15, 16),
+    4: (18, 20, 21),
+}
+ABDUCTION = {
+    0: (1, 3),
+    1: (6,),
+    2: (10,),
+    3: (14,),
+    4: (17, 19),
+}
+SWING_LIMIT = 0.04
+
+
+def tangential_roll(q, hand_pos, hand_quat_wxyz, obj_pos, axis, loads, radii, lower, upper, stuck):
+    """Joint step that slides freeze-loaded pads along +yaw at the grasp radius."""
+    sys.path.insert(0, "/home/rw/Documents/Complementarity-Free-Dexterous-Manipulation")
+    from models.sharpa.kinematics import SharpaKinematics
+
+    if not hasattr(tangential_roll, "kin"):
+        tangential_roll.kin = SharpaKinematics()
+    kin = tangential_roll.kin
+    q = np.asarray(q, dtype=float)
+    centers = kin.pad_centers(q, hand_pos, hand_quat_wxyz)
+    eps = 1e-4
+    flat = centers.reshape(-1)
+    jacobian = np.zeros((15, 22))
+    for joint in range(22):
+        bumped = q.copy()
+        bumped[joint] += eps
+        jacobian[:, joint] = (kin.pad_centers(bumped, hand_pos, hand_quat_wxyz).reshape(-1) - flat) / eps
+    desired = np.zeros(15)
+    columns = []
+    for finger, joints in FLEXION.items():
+        if float(loads[finger]) <= 0.5:
+            continue
+        columns.extend(joints)
+        columns.extend(ABDUCTION[finger])
+        delta = centers[finger] - np.asarray(obj_pos, dtype=float)
+        radial = delta - float(np.dot(delta, axis)) * axis
+        distance = float(np.linalg.norm(radial))
+        if distance < 1e-6:
+            continue
+        normal = radial / distance
+        tangent = np.cross(axis, normal)
+        tangent_norm = float(np.linalg.norm(tangent))
+        if tangent_norm < 1e-6:
+            continue
+        tangent = tangent / tangent_norm
+        desired[3 * finger: 3 * finger + 3] = 0.0015 * tangent + 0.3 * (float(radii[finger]) - distance) * normal
+    # A joint already against its URDF stop cannot keep sliding the pad.
+    # Isaac's action limits are wider than those stops, so use the URDF.
+    urdf_limits = kin.limits()
+    free = []
+    for joint in dict.fromkeys(columns):
+        if joint in stuck:
+            continue
+        low, high = urdf_limits[joint]
+        if q[joint] <= float(low) + 0.03 or q[joint] >= float(high) - 0.03:
+            continue
+        free.append(joint)
+    columns = free
+    command = np.zeros(22)
+    if not columns:
+        return command
+    jac = jacobian[:, columns]
+    gram = jac.T @ jac + 1e-4 * np.eye(len(columns))
+    command[columns] = np.linalg.solve(gram, jac.T @ desired)
+    return np.clip(command, -0.02, 0.02)
+
+
+def grasp_radii(q, hand_pos, hand_quat_wxyz, obj_pos, axis):
+    sys.path.insert(0, "/home/rw/Documents/Complementarity-Free-Dexterous-Manipulation")
+    from models.sharpa.kinematics import SharpaKinematics
+
+    centers = SharpaKinematics().pad_centers(q, hand_pos, hand_quat_wxyz)
+    radii = []
+    for finger in range(5):
+        delta = centers[finger] - np.asarray(obj_pos, dtype=float)
+        radial = delta - float(np.dot(delta, axis)) * axis
+        radii.append(float(np.linalg.norm(radial)))
+    return radii
+
+
+def block_opening(increment, loads0):
+    """Remove the part of a command that opens a finger loaded at the freeze."""
+    command = np.asarray(increment, dtype=float).copy()
+    for finger, joints in FLEXION.items():
+        if float(loads0[finger]) <= 0.5:
+            continue
+        for joint in joints:
+            if command[joint] < 0.0:
+                command[joint] = 0.0
+    return command
+
+
+def keep_loaded_curl(increment, q, q0, loads0, loads_now):
+    """Keep freeze-loaded pads on the cylinder while executing the planner increment.
+
+    Opening curl is removed. Abduction of those fingers stays within SWING_LIMIT
+    of the grasp, and a pad that has already left is walked back and closed.
+    """
+    command = np.asarray(increment, dtype=float).copy()
+    current = np.asarray(q, dtype=float)
+    origin = np.asarray(q0, dtype=float)
+    for finger, joints in FLEXION.items():
+        if float(loads0[finger]) <= 0.5:
+            continue
+        for joint in joints:
+            if command[joint] < 0.0:
+                command[joint] = 0.0
+        for joint in ABDUCTION[finger]:
+            proposed = current[joint] + command[joint]
+            low = origin[joint] - SWING_LIMIT
+            high = origin[joint] + SWING_LIMIT
+            proposed = min(max(proposed, low), high)
+            command[joint] = proposed - current[joint]
+    return command
 
 
 def apply_increment(env, base, env_id, increment, lower, upper, scale, num_envs):
@@ -247,11 +413,17 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
     hand_pos = (as_torch(base.hand.data.root_pos_w)[env_id].detach().cpu().numpy() - origin)
     hand_quat = as_torch(base.hand.data.root_quat_w)[env_id].detach().cpu().numpy()
     obj_pos = base.object_pos[env_id].detach().cpu().numpy()
-    q = actuated_position(base, env_id).detach().cpu().numpy()
+    slots = planner_slots(base.hand.joint_names)
+    q_isaac = actuated_position(base, env_id).detach().cpu().numpy()
+    q = to_planner(q_isaac, slots)
+    q0 = q.copy()
+    hand_quat_wxyz = xyzw_to_wxyz(hand_quat)
     yaw = yaw_about_z(as_torch(base.object.data.root_quat_w)[env_id].detach().cpu().numpy())
     z0 = float(obj_pos[2])
     loads0 = pad_loads(base, env_id).detach().cpu().numpy()
     axis = object_axis(as_torch(base.object.data.root_quat_w)[env_id].detach().cpu().numpy())
+    radii = grasp_radii(q, hand_pos, hand_quat_wxyz, obj_pos, axis)
+    print(f"grasp radii {['%.4f' % v for v in radii]}", flush=True)
     centers_w = loaded_sphere_centers(base, env_id, origin, obj_pos, axis, loads0)
     server = QsimServer(args_cli.jiang_repo)
     records = []
@@ -266,20 +438,110 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
             "sphere_centers_w": centers_w,
         })
         print(f"qsim planner ready centers={ready.get('local_centers')}", flush=True)
+        print(f"joint order {list(base.hand.joint_names)}", flush=True)
+        print(f"planner slots {slots}", flush=True)
+        good = None
+        last_yaw = yaw
+        q_prev = q.copy()
+        stuck = {}
+        phase = "roll"
+        phase_left = 0
+        yaw_window = []
         for step_id in range(args_cli.exec_steps):
             if not simulation_app.is_running():
                 break
             base._refresh_lab()
-            q = actuated_position(base, env_id).detach().cpu().numpy()
+            q_isaac = actuated_position(base, env_id).detach().cpu().numpy()
+            q = to_planner(q_isaac, slots)
             quat = as_torch(base.object.data.root_quat_w)[env_id].detach().cpu().numpy()
             yaw = yaw_about_z(quat)
+            loads_now = pad_loads(base, env_id).detach().cpu().numpy()
+            obj_now = base.object_pos[env_id].detach().cpu().numpy()
+            axis_now = object_axis(quat)
             result = server.request({"cmd": "step", "q": q.tolist(), "yaw": yaw})
-            increment = np.asarray(result["du"], dtype=float)
+            lower_p = to_planner(lower.detach().cpu().numpy(), slots)
+            upper_p = to_planner(upper.detach().cpu().numpy(), slots)
+            yaw_window.append(yaw)
+            if len(yaw_window) > 8:
+                yaw_window.pop(0)
+            plateau = (
+                phase == "roll"
+                and len(yaw_window) == 8
+                and yaw_window[-1] - yaw_window[0] < 0.03
+                and step_id > 12
+                and float(loads_now[0]) > 0.5
+                and float(loads_now[2]) > 0.5
+            )
+            if plateau:
+                phase = "release"
+                phase_left = 4
+                print(f"gait release at step {step_id}", flush=True)
+            if phase == "roll":
+                command = block_opening(
+                    tangential_roll(
+                        q, hand_pos, hand_quat_wxyz, obj_now, axis_now, loads0, radii, lower_p, upper_p,
+                        set(stuck),
+                    ),
+                    loads0,
+                )
+            elif phase == "release":
+                command = np.zeros(22)
+                for joint in FLEXION[2]:
+                    command[joint] = -0.015
+                phase_left -= 1
+                if phase_left <= 0 or float(loads_now[2]) < 0.2:
+                    phase = "swing"
+                    phase_left = 4
+                    print(f"gait swing at step {step_id}", flush=True)
+            elif phase == "swing":
+                # Slide the lifted middle finger further along +yaw, not back to the original pinch.
+                command = tangential_roll(
+                    q, hand_pos, hand_quat_wxyz, obj_now, axis_now, loads0,
+                    grasp_radii(q, hand_pos, hand_quat_wxyz, obj_now, axis_now),
+                    lower_p, upper_p, set(),
+                )
+                command[:9] = 0.0
+                command[13:] = 0.0
+                phase_left -= 1
+                if phase_left <= 0:
+                    phase = "regrasp"
+                    phase_left = 8
+                    print(f"gait regrasp at step {step_id}", flush=True)
+            else:
+                command = np.zeros(22)
+                for joint in FLEXION[2]:
+                    command[joint] = 0.02
+                phase_left -= 1
+                if float(loads_now[2]) > 0.5 or phase_left <= 0:
+                    phase = "roll"
+                    yaw_window = []
+                    stuck = {}
+                    print(f"gait roll at step {step_id}", flush=True)
+            last_yaw = yaw
+            prev = base.prev_targets[env_id].detach().cpu().numpy()
+            increment = to_isaac(command, slots, q_isaac.shape[0])
+            lead = prev - q_isaac
+            for joint in range(increment.shape[0]):
+                if increment[joint] * lead[joint] > 0.0 and abs(lead[joint]) > 0.05:
+                    increment[joint] = 0.0
+            if phase in ("release", "swing"):
+                for planner_joint in (0, 1, 2, 3, 4):
+                    increment[slots[planner_joint]] = 0.0
             apply_increment(env, base, env_id, increment, lower, upper, scale, args_cli.num_envs)
             base._refresh_lab()
+            q_after = to_planner(actuated_position(base, env_id).detach().cpu().numpy(), slots)
+            moved = q_after - q
+            for joint in range(22):
+                if abs(float(command[joint])) > 0.008 and abs(float(moved[joint])) < 0.002:
+                    stuck[joint] = step_id
+            stuck = {joint: seen for joint, seen in stuck.items() if step_id - seen < 12}
+            q_prev = q_after
+            if step_id % 10 == 0:
+                print(f"stuck {sorted(stuck)}", flush=True)
             z = float(base.object_pos[env_id, 2].item())
             loads = pad_loads(base, env_id).detach().cpu().numpy()
             yaw_after = yaw_about_z(as_torch(base.object.data.root_quat_w)[env_id].detach().cpu().numpy())
+            xy = base.object_pos[env_id, :2].detach().cpu().numpy() - obj_pos[:2]
             row = {
                 "event": "step",
                 "step": step_id,
@@ -287,6 +549,8 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
                 "yaw_pred": result["yaw_next"],
                 "yaw_in": result.get("yaw_in"),
                 "z": z,
+                "xy": [float(v) for v in xy],
+                "du": [float(v) for v in increment],
                 "du_norm": result["du_norm"],
                 "loads": loads.tolist(),
                 "sdists": result.get("sdists"),
@@ -299,8 +563,8 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
                 f"z={z:.4f} loads={[round(float(v), 3) for v in loads]} |du|={result['du_norm']:.4f}",
                 flush=True,
             )
-            xy = base.object_pos[env_id, :2].detach().cpu().numpy() - obj_pos[:2]
-            if z < z0 - DROP or float(np.linalg.norm(xy)) > 0.03 or bool(np.all(loads < 0.05)):
+            pads_left = phase == "roll" and bool(np.all(loads < 0.05))
+            if z < z0 - DROP or float(np.linalg.norm(xy)) > 0.03 or pads_left:
                 reason = "dropped" if z < z0 - DROP or float(np.linalg.norm(xy)) > 0.03 else "pads left the cylinder"
                 records.append({"event": "result", "stop": reason, "yaw": yaw_after, "z": z})
                 print(f"stop {reason} z={z:.4f} yaw={yaw_after:.4f}", flush=True)

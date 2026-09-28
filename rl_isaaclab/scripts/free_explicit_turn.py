@@ -85,9 +85,81 @@ def actuated_position(base, env_id):
     return position
 
 
+PLANNER_JOINTS = [
+    "right_thumb_CMC_FE",
+    "right_thumb_CMC_AA",
+    "right_thumb_MCP_FE",
+    "right_thumb_MCP_AA",
+    "right_thumb_IP",
+    "right_index_MCP_FE",
+    "right_index_MCP_AA",
+    "right_index_PIP",
+    "right_index_DIP",
+    "right_middle_MCP_FE",
+    "right_middle_MCP_AA",
+    "right_middle_PIP",
+    "right_middle_DIP",
+    "right_ring_MCP_FE",
+    "right_ring_MCP_AA",
+    "right_ring_PIP",
+    "right_ring_DIP",
+    "right_pinky_CMC",
+    "right_pinky_MCP_FE",
+    "right_pinky_MCP_AA",
+    "right_pinky_PIP",
+    "right_pinky_DIP",
+]
+
+
+def planner_slots(joint_names):
+    names = list(joint_names)
+    return [names.index(name) for name in PLANNER_JOINTS]
+
+
+def to_planner(q_isaac, slots):
+    return np.asarray(q_isaac, dtype=float)[np.asarray(slots, dtype=int)]
+
+
+def to_isaac(q_planner, slots, size):
+    out = np.zeros(size, dtype=float)
+    out[np.asarray(slots, dtype=int)] = np.asarray(q_planner, dtype=float)
+    return out
+
+
 def targets_to_actions(q_des, prev, scale, lower, upper):
     q_des = torch.maximum(torch.minimum(q_des, upper), lower)
     return ((q_des - prev) / scale).clamp(-1.0, 1.0)
+
+
+FLEXION = {
+    0: (0, 2, 4),
+    1: (5, 7, 8),
+    2: (9, 11, 12),
+    3: (13, 15, 16),
+    4: (18, 20, 21),
+}
+ABDUCTION = {
+    0: (1, 3),
+    1: (6,),
+    2: (10,),
+    3: (14,),
+    4: (17, 19),
+}
+
+
+def keep_loaded_curl(increment, loads):
+    """Move only the fingers that were loaded at the freeze, and do not open them."""
+    command = np.asarray(increment, dtype=float).copy()
+    for finger, joints in FLEXION.items():
+        side = ABDUCTION[finger]
+        if float(loads[finger]) <= 0.5:
+            for joint in list(joints) + list(side):
+                command[joint] = 0.0
+            continue
+        for joint in joints:
+            if command[joint] < 0.0:
+                command[joint] = 0.0
+    return command
 
 
 def apply_joint_target(env, base, env_id, q_des, lower, upper, scale, num_envs):
@@ -200,7 +272,8 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
     hand_quat = as_torch(base.hand.data.root_quat_w)[env_id].detach().cpu().numpy()
     obj_pos = base.object_pos[env_id].detach().cpu().numpy()
     obj_quat = as_torch(base.object.data.root_quat_w)[env_id].detach().cpu().numpy()
-    q = actuated_position(base, env_id).detach().cpu().numpy()
+    slots = planner_slots(base.hand.joint_names)
+    q = to_planner(actuated_position(base, env_id).detach().cpu().numpy(), slots)
     z0 = float(obj_pos[2])
     loads0 = pad_loads(base, env_id).detach().cpu().numpy()
     axis = xyzw_to_matrix(obj_quat)[:, 2]
@@ -222,12 +295,14 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
             "sphere_centers_w": centers_w,
         })
         print(f"FREE MPCExplicit ready nq={ready.get('nq')}", flush=True)
+        print(f"planner slots {slots}", flush=True)
         yaw_after = yaw_about_z(obj_quat)
         for step_id in range(args_cli.exec_steps):
             if not simulation_app.is_running():
                 break
             base._refresh_lab()
-            q = actuated_position(base, env_id).detach().cpu().numpy()
+            q_isaac = actuated_position(base, env_id).detach().cpu().numpy()
+            q = to_planner(q_isaac, slots)
             obj_pos_now = base.object_pos[env_id].detach().cpu().numpy()
             obj_quat = as_torch(base.object.data.root_quat_w)[env_id].detach().cpu().numpy()
             result = client.request({
@@ -236,7 +311,14 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
                 "obj_quat_xyzw": [float(v) for v in obj_quat],
                 "q": q.tolist(),
             })
-            q_des = q + np.asarray(result["action"], dtype=float)
+            action = keep_loaded_curl(result["action"], loads0)
+            prev = base.prev_targets[env_id].detach().cpu().numpy()
+            print(
+                f"track gap {float(np.max(np.abs(prev - q_isaac))):.4f} "
+                + "action " + " ".join(f"{float(v):+.4f}" for v in action),
+                flush=True,
+            )
+            q_des = prev + to_isaac(action, slots, q_isaac.shape[0])
             apply_joint_target(env, base, env_id, q_des, lower, upper, scale, args_cli.num_envs)
             base._refresh_lab()
             z = float(base.object_pos[env_id, 2].item())

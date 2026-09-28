@@ -74,9 +74,84 @@ def actuated_position(base, env_id):
     return position
 
 
+PLANNER_JOINTS = [
+    "right_thumb_CMC_FE",
+    "right_thumb_CMC_AA",
+    "right_thumb_MCP_FE",
+    "right_thumb_MCP_AA",
+    "right_thumb_IP",
+    "right_index_MCP_FE",
+    "right_index_MCP_AA",
+    "right_index_PIP",
+    "right_index_DIP",
+    "right_middle_MCP_FE",
+    "right_middle_MCP_AA",
+    "right_middle_PIP",
+    "right_middle_DIP",
+    "right_ring_MCP_FE",
+    "right_ring_MCP_AA",
+    "right_ring_PIP",
+    "right_ring_DIP",
+    "right_pinky_CMC",
+    "right_pinky_MCP_FE",
+    "right_pinky_MCP_AA",
+    "right_pinky_PIP",
+    "right_pinky_DIP",
+]
+
+
+def planner_slots(joint_names):
+    names = list(joint_names)
+    return [names.index(name) for name in PLANNER_JOINTS]
+
+
+def to_planner(q_isaac, slots):
+    return np.asarray(q_isaac, dtype=float)[np.asarray(slots, dtype=int)]
+
+
+def to_isaac(q_planner, slots, size):
+    out = np.zeros(size, dtype=float)
+    out[np.asarray(slots, dtype=int)] = np.asarray(q_planner, dtype=float)
+    return out
+
+
 def targets_to_actions(q_des, prev, scale, lower, upper):
     q_des = torch.maximum(torch.minimum(q_des, upper), lower)
     return ((q_des - prev) / scale).clamp(-1.0, 1.0)
+
+
+FLEXION = {
+    0: (0, 2, 4),
+    1: (5, 7, 8),
+    2: (9, 11, 12),
+    3: (13, 15, 16),
+    4: (18, 20, 21),
+}
+ABDUCTION = {
+    0: (1, 3),
+    1: (6,),
+    2: (10,),
+    3: (14,),
+    4: (17, 19),
+}
+
+
+def keep_loaded_curl(ctrl, q, loads):
+    """Keep a loaded finger from opening or swinging off the cylinder."""
+    command = np.asarray(ctrl, dtype=float).copy()
+    current = np.asarray(q, dtype=float)
+    for finger, joints in FLEXION.items():
+        side = ABDUCTION[finger]
+        if float(loads[finger]) <= 0.5:
+            for joint in joints + side:
+                command[joint] = current[joint]
+            continue
+        for joint in joints:
+            if command[joint] < current[joint]:
+                command[joint] = current[joint]
+        for joint in side:
+            command[joint] = current[joint]
+    return command
 
 
 def apply_target(env, base, env_id, target, lower, upper, scale, num_envs):
@@ -214,6 +289,9 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
     hand_quat = as_torch(base.hand.data.root_quat_w)[env_id].detach().cpu().numpy()
     obj_pos0 = base.object_pos[env_id].detach().cpu().numpy().copy()
     z0 = float(obj_pos0[2])
+    loads0 = pad_loads(base, env_id).detach().cpu().numpy()
+    slots = planner_slots(base.hand.joint_names)
+    print(f"planner slots {slots}", flush=True)
     server = DropServer(args_cli.mjpc_image, args_cli.mjpc_repo)
     records = []
     try:
@@ -221,12 +299,16 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
             if not simulation_app.is_running():
                 break
             base._refresh_lab()
-            q = actuated_position(base, env_id).detach().cpu().numpy()
+            q_isaac = actuated_position(base, env_id).detach().cpu().numpy()
+            q = to_planner(q_isaac, slots)
             obj_pos = base.object_pos[env_id].detach().cpu().numpy()
             obj_quat = as_torch(base.object.data.root_quat_w)[env_id].detach().cpu().numpy()
             pose = cylinder_in_hand(hand_pos, hand_quat, obj_pos, obj_quat)
             command = "init" if step_id == 0 else "step"
-            ctrl = server.request(command, pose, q)
+            ctrl_p = keep_loaded_curl(server.request(command, pose, q), q, loads0)
+            delta = np.clip(ctrl_p - q, -0.02, 0.02)
+            prev = base.prev_targets[env_id].detach().cpu().numpy()
+            ctrl = prev + to_isaac(delta, slots, q_isaac.shape[0])
             if ctrl.shape != (22,):
                 raise RuntimeError(f"expected 22 targets, got {ctrl.shape}")
             apply_target(env, base, env_id, ctrl, lower, upper, scale, args_cli.num_envs)
@@ -234,7 +316,11 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
             z = float(base.object_pos[env_id, 2].item())
             loads = pad_loads(base, env_id).detach().cpu().numpy()
             yaw = yaw_about_z(as_torch(base.object.data.root_quat_w)[env_id].detach().cpu().numpy())
-            move = float(np.max(np.abs(ctrl - q)))
+            move = float(np.max(np.abs(delta)))
+            print(
+                "delta " + " ".join(f"{float(v):+.3f}" for v in delta),
+                flush=True,
+            )
             row = {
                 "event": "step",
                 "step": step_id,

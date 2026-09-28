@@ -8,3 +8,5 @@ logs/
 python/
 /build/
 !pretrained
+.vscode/
+refs/

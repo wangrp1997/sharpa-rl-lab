@@ -35,7 +35,7 @@ Jin，arXiv:2408.07855。开源求解器是 `MPCExplicit`，接到这只手上�
 
 ## Jiang
 
-Jiang 等，arXiv:2505.04978。开源求解器是 Drake qsim 加 Crocoddyl，接到这只手上的入口是 `rl_isaaclab/scripts/jiang_qsim_turn.py`。`jiang_turn.py` 和 `jiang_mpc.py` 是自行重写的前向模型，不作这个结果。代价和关节增量界限 ±0.08 rad 没有改。接触指取冻结时力大于 0.5 N 的指腹，球在开始时压一次。
+Jiang 等，arXiv:2505.04978。开源求解器是 Drake qsim 加 Crocoddyl，接到这只手上的入口是 `rl_isaaclab/scripts/jiang_qsim_turn.py`。代价和关节增量界限 ±0.08 rad 没有改。接触指取冻结时力大于 0.5 N 的指腹，球在开始时压一次。
 
 同一种子，环境 108。已加载手指的张开分量被去掉。40 步里转角从 0.124 rad 升到 0.520 rad，然后退到 0.046 rad。往上转的增量主要是拇指和中指侧摆。中指侧摆累加约 0.2 rad 后力掉到 0，拇指随后也离开，圆柱往旁边移。日志 `logs/live_diag/jiang_ordered_40.jsonl`。
 
